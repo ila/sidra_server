@@ -1,15 +1,45 @@
 # name: test/sql/query_checker.test
-# description: Test SIDRA privacy constraint checker for decentralized materialized views
+# description: Test SIDRA privacy constraint checker for decentralized tables and views
 # group: [sql]
 
 require server
 
 # ============================================================
-# Rule: Decentralized tables must have constraints
+# Decentralized tables must have constraints
 # ============================================================
 
-# Decentralized table without any constraints — rejected
+# No constraints at all — rejected
 statement error
 CREATE DECENTRALIZED TABLE t1 (id INT, city VARCHAR, steps INT);
 ----
 Decentralized tables must have privacy-preserving constraints
+
+# ============================================================
+# Decentralized tables must have at least one FACT column
+# ============================================================
+
+# Only SENSITIVE and DIMENSION, no FACT — rejected
+statement error
+CREATE DECENTRALIZED TABLE t2 (id INT SENSITIVE, city VARCHAR DIMENSION);
+----
+Decentralized tables must have at least one FACT column
+
+# ============================================================
+# Decentralized tables must have at least one DIMENSION column
+# ============================================================
+
+# Only FACT, no DIMENSION — rejected
+statement error
+CREATE DECENTRALIZED TABLE t3 (id INT, steps INT FACT);
+----
+Decentralized tables must have at least one DIMENSION column
+
+# ============================================================
+# Only SENSITIVE is not enough
+# ============================================================
+
+# Only SENSITIVE — no FACT and no DIMENSION
+statement error
+CREATE DECENTRALIZED TABLE t4 (id INT SENSITIVE, city VARCHAR);
+----
+Decentralized tables must have at least one FACT column

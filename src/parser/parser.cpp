@@ -322,6 +322,22 @@ ParserExtensionParseResult SIDRAParserExtension::SIDRAParseFunction(ParserExtens
 			if (data->table_constraints.empty()) {
 				throw ParserException("Decentralized tables must have privacy-preserving constraints!");
 			}
+			bool has_fact = false;
+			bool has_dimension = false;
+			for (auto &[col, c] : data->table_constraints) {
+				if (c.fact) {
+					has_fact = true;
+				}
+				if (c.dimension) {
+					has_dimension = true;
+				}
+			}
+			if (!has_fact) {
+				throw ParserException("Decentralized tables must have at least one FACT column!");
+			}
+			if (!has_dimension) {
+				throw ParserException("Decentralized tables must have at least one DIMENSION column!");
+			}
 		}
 		data->table_name = ExtractTableName(cleaned);
 	} else if (StringUtil::StartsWith(cleaned, "create materialized view")) {
