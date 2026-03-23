@@ -1,0 +1,63 @@
+# name: test/sql/parser.test
+# description: Test SIDRA parser extension (scope, table, view, select)
+# group: [sql]
+
+require server
+
+# --- Scope detection ---
+
+# Views must be materialized
+statement error
+CREATE DECENTRALIZED VIEW test AS SELECT 1;
+----
+Views should be materialized
+
+# Replicated tables must be materialized views
+statement error
+CREATE REPLICATED TABLE test (id INT);
+----
+Replicated tables must be materialized views
+
+# Multiple scopes rejected by DuckDB parser
+statement error
+CREATE CENTRALIZED DECENTRALIZED TABLE test (id INT);
+----
+syntax error
+
+# --- View constraints ---
+
+# Decentralized views require WINDOW
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t TTL 72 REFRESH 6;
+----
+WINDOW is a required field
+
+# Decentralized views require TTL
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 REFRESH 6;
+----
+TTL is a required field
+
+# TTL must be >= WINDOW
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 TTL 12 REFRESH 6;
+----
+TTL must be greater than or equal to WINDOW
+
+# WINDOW is not allowed for centralized views
+statement error
+CREATE CENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 REFRESH 6;
+----
+WINDOW is not allowed for centralized or replicated tables
+
+# MINIMUM AGGREGATION is not allowed for decentralized views
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 TTL 72 REFRESH 6 MINIMUM AGGREGATION 10;
+----
+MINIMUM AGGREGATION is not allowed for decentralized tables
+
+# REFRESH is always required
+statement error
+CREATE CENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t;
+----
+REFRESH is a required field
