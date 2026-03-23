@@ -1,0 +1,15 @@
+# name: test/sql/query_checker.test
+# description: Test SIDRA privacy constraint checker for decentralized materialized views
+# group: [sql]
+
+require server
+
+# ============================================================
+# Rule: Decentralized tables must have constraints
+# ============================================================
+
+# Decentralized table without any constraints — rejected
+statement error
+CREATE DECENTRALIZED TABLE t1 (id INT, city VARCHAR, steps INT);
+----
+Decentralized tables must have privacy-preserving constraints

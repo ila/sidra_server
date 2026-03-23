@@ -256,6 +256,37 @@ static string CompileViewCreation(Connection &con, SIDRAParseData &data, const s
 		metadata_queries += view_constraint_str;
 
 	} else if (data.scope == TableScope::decentralized) {
+		// Validate the view query against table constraints
+		// Fetch constraints of all tables referenced in the view
+		unordered_map<string, SIDRAConstraints> all_constraints;
+		con.BeginTransaction();
+		try {
+			auto table_names = con.GetTableNames(view_query);
+			con.Rollback();
+
+			// Switch to metadata DB to look up constraints
+			auto constraints_query = "select column_name, sidra_sensitive, sidra_fact, sidra_dimension from "
+			                         "sidra_parser_internal.sidra_table_constraints";
+			auto constraints_result = con.Query(constraints_query);
+			if (!constraints_result->HasError()) {
+				for (idx_t i = 0; i < constraints_result->RowCount(); i++) {
+					string col_name = StringUtil::Lower(constraints_result->GetValue(0, i).ToString());
+					SIDRAConstraints c;
+					c.sensitive = constraints_result->GetValue(1, i).GetValue<bool>();
+					c.fact = constraints_result->GetValue(2, i).GetValue<bool>();
+					c.dimension = constraints_result->GetValue(3, i).GetValue<bool>();
+					all_constraints[col_name] = c;
+				}
+			}
+		} catch (...) {
+			con.Rollback();
+			throw;
+		}
+
+		if (!all_constraints.empty()) {
+			CheckViewQueryConstraints(con, view_query, all_constraints);
+		}
+
 		metadata_queries += "insert into sidra_view_constraints values('" + EscapeSingleQuotes(view_name) + "', " +
 		                    to_string(vc.window) + ", " + to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " +
 		                    to_string(vc.min_agg) + ", now());\n";
