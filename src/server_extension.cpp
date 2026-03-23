@@ -5,6 +5,7 @@
 #include "common.hpp"
 #include "flush_function.hpp"
 #include "generate_python_script.hpp"
+#include "optimizer.hpp"
 #include "parser.hpp"
 #include "run_server.hpp"
 #include "server_debug.hpp"
@@ -94,6 +95,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db_config = DBConfig::GetConfig(instance);
 	ParserExtension::Register(db_config, SIDRAParserExtension());
 	SERVER_DEBUG_PRINT("Registered SIDRA parser extension");
+
+	// Register optimizer rule for DROP TABLE metadata cleanup
+	OptimizerExtension::Register(db_config, SIDRADropTableRule());
+	SERVER_DEBUG_PRINT("Registered SIDRA DROP TABLE optimizer rule");
 
 	// Register pragma functions
 	auto flush = PragmaFunction::PragmaCall("flush", FlushFunction, {LogicalType::VARCHAR}, {LogicalType::VARCHAR});

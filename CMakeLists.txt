@@ -19,6 +19,7 @@ set(EXTENSION_SOURCES
     src/parser/parser.cpp
     src/parser/parser_helper.cpp
     src/parser/parser_helpers.cpp
+    src/optimizer/optimizer.cpp
     src/compiler/compiler_utils.cpp
     src/compiler/generate_python_script.cpp)
 

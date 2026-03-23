@@ -160,13 +160,17 @@ unordered_map<string, SIDRAConstraints> ExtractTableConstraints(string &query) {
 		SIDRAConstraints constraints;
 
 		// Check for SIDRA constraints using proper word boundaries
-		if (std::regex_search(col_def, std::regex(R"(\bfact\b)", std::regex_constants::icase))) {
+		static const std::regex FACT_REGEX(R"(\bfact\b)", std::regex_constants::icase);
+		static const std::regex SENSITIVE_REGEX(R"(\bsensitive\b)", std::regex_constants::icase);
+		static const std::regex DIMENSION_REGEX(R"(\bdimension\b)", std::regex_constants::icase);
+
+		if (std::regex_search(col_def, FACT_REGEX)) {
 			constraints.fact = true;
 		}
-		if (std::regex_search(col_def, std::regex(R"(\bsensitive\b)", std::regex_constants::icase))) {
+		if (std::regex_search(col_def, SENSITIVE_REGEX)) {
 			constraints.sensitive = true;
 		}
-		if (std::regex_search(col_def, std::regex(R"(\bdimension\b)", std::regex_constants::icase))) {
+		if (std::regex_search(col_def, DIMENSION_REGEX)) {
 			constraints.dimension = true;
 		}
 
@@ -176,7 +180,8 @@ unordered_map<string, SIDRAConstraints> ExtractTableConstraints(string &query) {
 	}
 
 	// Strip constraint keywords from query
-	query = std::regex_replace(query, std::regex(R"(\b(sensitive|fact|dimension)\b)", std::regex_constants::icase), "");
+	static const std::regex STRIP_CONSTRAINTS_REGEX(R"(\b(sensitive|fact|dimension)\b)", std::regex_constants::icase);
+	query = std::regex_replace(query, STRIP_CONSTRAINTS_REGEX, "");
 
 	SERVER_DEBUG_PRINT("Extracted " + to_string(result.size()) + " column constraints");
 	return result;
