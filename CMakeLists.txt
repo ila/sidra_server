@@ -18,9 +18,7 @@ set(EXTENSION_SOURCES
     src/flush/update_metrics.cpp
     src/parser/parser.cpp
     src/parser/parser_helper.cpp
-    src/parser/parse_table.cpp
-    src/parser/parse_view.cpp
-    src/parser/parse_select.cpp
+    src/parser/parser_helpers.cpp
     src/compiler/compiler_utils.cpp
     src/compiler/generate_python_script.cpp)
 

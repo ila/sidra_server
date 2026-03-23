@@ -1,63 +1,138 @@
 # name: test/sql/parser.test
-# description: Test SIDRA parser extension (scope, table, view, select)
+# description: Test SIDRA parser extension
 # group: [sql]
 
 require server
 
-# --- Scope detection ---
+# ============================================================
+# Scope detection
+# ============================================================
 
-# Views must be materialized
+# Non-materialized views are not allowed
 statement error
 CREATE DECENTRALIZED VIEW test AS SELECT 1;
 ----
 Views should be materialized
 
-# Replicated tables must be materialized views
+# Replicated must be a materialized view, not a table
 statement error
 CREATE REPLICATED TABLE test (id INT);
 ----
 Replicated tables must be materialized views
 
-# Multiple scopes rejected by DuckDB parser
+# Multiple scopes rejected by DuckDB parser before reaching extension
 statement error
 CREATE CENTRALIZED DECENTRALIZED TABLE test (id INT);
 ----
 syntax error
 
-# --- View constraints ---
+# ============================================================
+# View constraints — decentralized
+# ============================================================
 
-# Decentralized views require WINDOW
+# Missing WINDOW
 statement error
 CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t TTL 72 REFRESH 6;
 ----
 WINDOW is a required field
 
-# Decentralized views require TTL
+# Missing TTL
 statement error
 CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 REFRESH 6;
 ----
 TTL is a required field
 
-# TTL must be >= WINDOW
+# Missing REFRESH
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 TTL 72;
+----
+REFRESH is a required field
+
+# TTL < WINDOW
 statement error
 CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 TTL 12 REFRESH 6;
 ----
 TTL must be greater than or equal to WINDOW
 
-# WINDOW is not allowed for centralized views
-statement error
-CREATE CENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 REFRESH 6;
-----
-WINDOW is not allowed for centralized or replicated tables
-
-# MINIMUM AGGREGATION is not allowed for decentralized views
+# MINIMUM AGGREGATION not allowed for decentralized
 statement error
 CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 TTL 72 REFRESH 6 MINIMUM AGGREGATION 10;
 ----
 MINIMUM AGGREGATION is not allowed for decentralized tables
 
-# REFRESH is always required
+# ============================================================
+# View constraints — centralized
+# ============================================================
+
+# WINDOW not allowed for centralized
+statement error
+CREATE CENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 REFRESH 6;
+----
+WINDOW is not allowed for centralized or replicated tables
+
+# TTL not allowed for centralized
+statement error
+CREATE CENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t TTL 72 REFRESH 6;
+----
+TTL is not allowed for centralized or replicated tables
+
+# Missing REFRESH for centralized
 statement error
 CREATE CENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t;
 ----
 REFRESH is a required field
+
+# ============================================================
+# View constraints — replicated
+# ============================================================
+
+# WINDOW not allowed for replicated
+statement error
+CREATE REPLICATED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 REFRESH 6;
+----
+WINDOW is not allowed for centralized or replicated tables
+
+# TTL not allowed for replicated
+statement error
+CREATE REPLICATED MATERIALIZED VIEW test AS SELECT 1 FROM t TTL 72 REFRESH 6;
+----
+TTL is not allowed for centralized or replicated tables
+
+# Missing REFRESH for replicated
+statement error
+CREATE REPLICATED MATERIALIZED VIEW test AS SELECT 1 FROM t;
+----
+REFRESH is a required field
+
+# ============================================================
+# Edge cases — comments and whitespace
+# ============================================================
+
+# SQL with line comments should still be parsed
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test -- a comment
+AS SELECT 1 FROM t WINDOW 24 TTL 72;
+----
+REFRESH is a required field
+
+# SQL with block comments should still be parsed
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test /* block comment */ AS SELECT 1 FROM t WINDOW 24 TTL 72;
+----
+REFRESH is a required field
+
+# Extra whitespace between keywords
+statement error
+CREATE   DECENTRALIZED   MATERIALIZED   VIEW   test AS SELECT 1 FROM t WINDOW 24 TTL 72;
+----
+REFRESH is a required field
+
+# ============================================================
+# Reserved name validation
+# ============================================================
+
+# View name starting with sidra_staging_view_ is rejected
+statement error
+CREATE CENTRALIZED MATERIALIZED VIEW sidra_staging_view_test AS SELECT 1 FROM t REFRESH 6;
+----
+Views cannot start with sidra_staging_view_
