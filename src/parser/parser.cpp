@@ -198,20 +198,6 @@ static string CompileTableCreation(Connection &con, SIDRAParseData &data) {
 			throw ParserException("Error validating table: " + r->GetError());
 		}
 
-		con.BeginTransaction();
-		try {
-			Parser parser;
-			parser.ParseQuery(data.stripped_sql);
-			auto statement = parser.statements[0].get();
-			Planner planner(*con.context);
-			planner.CreatePlan(statement->Copy());
-			CheckConstraints(*planner.plan, data.table_constraints);
-			con.Rollback();
-		} catch (...) {
-			con.Rollback();
-			throw;
-		}
-
 		metadata_queries += "insert into sidra_tables values('" + EscapeSingleQuotes(table_name) + "', " +
 		                    to_string(static_cast<int32_t>(data.scope)) + ", NULL, 0);\n";
 
@@ -333,6 +319,9 @@ ParserExtensionParseResult SIDRAParserExtension::SIDRAParseFunction(ParserExtens
 		data->is_table = true;
 		if (scope == TableScope::decentralized) {
 			data->table_constraints = ExtractTableConstraints(cleaned);
+			if (data->table_constraints.empty()) {
+				throw ParserException("Decentralized tables must have privacy-preserving constraints!");
+			}
 		}
 		data->table_name = ExtractTableName(cleaned);
 	} else if (StringUtil::StartsWith(cleaned, "create materialized view")) {
