@@ -120,9 +120,33 @@ void GenerateClientRefreshScript(ClientContext &context, const FunctionParameter
 	file << "#!/usr/bin/env python3\n";
 	file << "import duckdb\n";
 	file << "import time\n";
+	file << "import os\n";
 	file << "from datetime import datetime, timedelta\n\n";
 
-	// TODO: implement client-side refresh script generation
+	file << "database_name = \"" + database_name + "\"\n\n";
+
+	// Connect to the client database and query view metadata
+	file << "con = duckdb.connect(database = database_name + '.db')\n";
+	file << "con.execute(\"SELECT name FROM sidra_tables WHERE is_view = true\")\n";
+	file << "views = [row[0] for row in con.fetchall()]\n";
+	file << "con.close()\n\n";
+
+	// Generate refresh loop
+	file << "print(f'Client refresh script for {database_name}')\n";
+	file << "print(f'Found {len(views)} views to refresh')\n\n";
+
+	file << "while True:\n";
+	file << "\tcurrent_time = datetime.now()\n";
+	file << "\tprint(f'[{current_time.strftime(\"%Y-%m-%d %H:%M:%S\")}] Running client refresh cycle...')\n";
+	file << "\tfor view in views:\n";
+	file << "\t\ttry:\n";
+	file << "\t\t\tcon = duckdb.connect(database = database_name + '.db')\n";
+	file << "\t\t\tcon.execute(f\"PRAGMA refresh('{view}')\")\n";
+	file << "\t\t\tcon.close()\n";
+	file << "\t\t\tprint(f'[{datetime.now().strftime(\"%Y-%m-%d %H:%M:%S\")}] Refreshed view: {view}')\n";
+	file << "\t\texcept Exception as e:\n";
+	file << "\t\t\tprint(f'[{datetime.now().strftime(\"%Y-%m-%d %H:%M:%S\")}] Error refreshing {view}: {e}')\n";
+	file << "\ttime.sleep(600)\n";
 
 	file.close();
 }

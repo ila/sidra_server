@@ -56,8 +56,11 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 		throw ParserException("Invalid database type: " + database + " - only duckdb and postgres are supported!");
 	}
 
-	// TODO: make config path configurable
-	string config_path = "";
+	string config_path;
+	Value config_path_val;
+	if (context.TryGetCurrentSetting("sidra_config_path", config_path_val)) {
+		config_path = config_path_val.ToString();
+	}
 	string config_file = "server.config";
 	auto config = ParseConfig(config_path, config_file);
 

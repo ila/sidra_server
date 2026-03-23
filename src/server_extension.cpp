@@ -56,8 +56,8 @@ void ParseJSON(Connection &con, std::unordered_map<string, string> &config, int3
 	// remove newlines using erase-remove idiom
 	buffer.erase(std::remove(buffer.begin(), buffer.end(), '\n'), buffer.end());
 
-	// TODO: add schema name
-	Appender appender(con, "statistics");
+	string schema_name = config.count("schema_name") ? config["schema_name"] : "main";
+	Appender appender(con, schema_name, "statistics");
 	appender.BeginRow();
 	appender.Append<string_t>(string(buffer.begin(), buffer.end()));
 	appender.Append<hugeint_t>(client);
@@ -91,8 +91,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 		SERVER_DEBUG_PRINT("No server.config found, skipping server initialization");
 	}
 
-	// Register parser extension
+	// Register extension option for config path
 	auto &db_config = DBConfig::GetConfig(instance);
+	db_config.AddExtensionOption("sidra_config_path", "Path to SIDRA server config directory", LogicalType::VARCHAR,
+	                             Value(""));
+
+	// Register parser extension
 	ParserExtension::Register(db_config, SIDRAParserExtension());
 	SERVER_DEBUG_PRINT("Registered SIDRA parser extension");
 
