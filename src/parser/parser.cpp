@@ -383,6 +383,12 @@ ParserExtensionPlanResult SIDRAParserExtension::SIDRAPlanFunction(ParserExtensio
 		metadata_queries = CompileViewCreation(shadow_con, data);
 	}
 
+	// For centralized/replicated tables, also execute the DDL in the main DB
+	// (decentralized tables only exist in the shadow DB — they're virtual on the server)
+	if (data.is_table && data.scope != TableScope::decentralized && !data.stripped_sql.empty()) {
+		metadata_queries.insert(metadata_queries.begin(), data.stripped_sql);
+	}
+
 	// Store in thread-local for the bind function
 	g_sidra_main_queries = std::move(metadata_queries);
 

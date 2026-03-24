@@ -33,11 +33,32 @@ CREATE DECENTRALIZED TABLE t4 (id INT SENSITIVE, city VARCHAR);
 Decentralized tables must have at least one FACT column
 
 # ============================================================
-# Setup: valid table for view tests
+# Setup: create base table
 # ============================================================
 
 statement ok
-CREATE DECENTRALIZED TABLE runs (nickname VARCHAR, city VARCHAR DIMENSION, steps INT FACT, hr INT SENSITIVE);
+CREATE DECENTRALIZED TABLE runs (nickname VARCHAR, city VARCHAR DIMENSION, date DATE DIMENSION, steps INT FACT, hr INT SENSITIVE);
+
+# Verify metadata was stored
+query II
+SELECT name, type FROM sidra_tables WHERE name = 'runs';
+----
+runs	2
+
+# Verify constraints were stored
+query IIII
+SELECT column_name, sidra_sensitive, sidra_fact, sidra_dimension FROM sidra_table_constraints WHERE table_name = 'runs' ORDER BY column_name;
+----
+city	false	false	true
+date	false	false	true
+hr	true	false	false
+steps	false	true	false
+
+# Duplicate table creation should fail
+statement error
+CREATE DECENTRALIZED TABLE runs (nickname VARCHAR, city VARCHAR DIMENSION, steps INT FACT);
+----
+already exists
 
 # ============================================================
 # DMV must have aggregation
@@ -48,8 +69,14 @@ CREATE DECENTRALIZED MATERIALIZED VIEW no_agg AS SELECT city FROM runs WINDOW 24
 ----
 must contain at least one aggregation
 
+# Raw projection of all columns — no aggregation
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW raw_all AS SELECT nickname, city, date, steps, hr FROM runs WINDOW 24 TTL 72 REFRESH 6;
+----
+must contain at least one aggregation
+
 # ============================================================
-# SENSITIVE in GROUP BY
+# SENSITIVE column in GROUP BY — rejected
 # ============================================================
 
 statement error
@@ -57,8 +84,14 @@ CREATE DECENTRALIZED MATERIALIZED VIEW sens_gb AS SELECT hr, SUM(steps) FROM run
 ----
 cannot be used in GROUP BY
 
+# SENSITIVE column as the only GROUP BY column
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW sens_gb2 AS SELECT hr, COUNT(*) FROM runs GROUP BY hr WINDOW 24 TTL 72 REFRESH 6;
+----
+cannot be used in GROUP BY
+
 # ============================================================
-# FACT in GROUP BY
+# FACT column in GROUP BY — rejected
 # ============================================================
 
 statement error
@@ -66,9 +99,75 @@ CREATE DECENTRALIZED MATERIALIZED VIEW fact_gb AS SELECT steps, COUNT(*) FROM ru
 ----
 cannot be used in GROUP BY
 
+# FACT with DIMENSION in GROUP BY — FACT still rejected
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW fact_gb2 AS SELECT city, steps, COUNT(*) FROM runs GROUP BY city, steps WINDOW 24 TTL 72 REFRESH 6;
+----
+cannot be used in GROUP BY
+
 # ============================================================
-# Valid DMV: DIMENSION in GROUP BY + FACT in SUM
+# Valid DMVs
+# ============================================================
+
+# Basic: DIMENSION in GROUP BY + FACT in SUM
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW daily_steps AS SELECT city, SUM(steps) AS total FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+
+# Verify view metadata
+query II
+SELECT name, type FROM sidra_tables WHERE name = 'daily_steps';
+----
+daily_steps	2
+
+# Multiple DIMENSION columns in GROUP BY
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW city_date AS SELECT city, date, SUM(steps) AS total FROM runs GROUP BY city, date WINDOW 24 TTL 72 REFRESH 6;
+
+# Multiple aggregations (SUM + COUNT)
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW multi_agg AS SELECT city, SUM(steps) AS total_steps, COUNT(*) AS num_entries FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+
+# AVG aggregation
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW avg_view AS SELECT city, AVG(steps) AS avg_steps FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+
+# MIN/MAX aggregation over FACT
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW minmax_view AS SELECT city, MIN(steps) AS min_s, MAX(steps) AS max_s FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+
+# WHERE filter on DIMENSION column (allowed — filters below aggregation are OK)
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW filter_dim AS SELECT city, SUM(steps) AS total FROM runs WHERE city = 'Berlin' GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+
+# WHERE filter on unannotated column (allowed)
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW filter_plain AS SELECT city, SUM(steps) AS total FROM runs WHERE nickname = 'runner42' GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+
+# ============================================================
+# Verify view constraint metadata
+# ============================================================
+
+query III
+SELECT view_name, sidra_window, sidra_refresh FROM sidra_view_constraints WHERE view_name = 'daily_steps';
+----
+daily_steps	24	6
+
+# ============================================================
+# DROP TABLE cleans up metadata (centralized tables)
 # ============================================================
 
 statement ok
-CREATE DECENTRALIZED MATERIALIZED VIEW good_view AS SELECT city, SUM(steps) AS total FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+CREATE CENTRALIZED TABLE to_drop (code VARCHAR, name VARCHAR);
+
+query I
+SELECT COUNT(*) FROM sidra_tables WHERE name = 'to_drop';
+----
+1
+
+statement ok
+DROP TABLE to_drop;
+
+query I
+SELECT COUNT(*) FROM sidra_tables WHERE name = 'to_drop';
+----
+0

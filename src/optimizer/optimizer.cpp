@@ -1,4 +1,6 @@
 #include "optimizer.hpp"
+#include "common.hpp"
+#include "compiler_utils.hpp"
 #include "server_debug.hpp"
 
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -24,33 +26,41 @@ void SIDRADropTableRule::Optimize(OptimizerExtensionInput &input, unique_ptr<Log
 	string table_name = drop_info.name;
 	SERVER_DEBUG_PRINT("DROP TABLE detected for: " + table_name);
 
-	// Clean up SIDRA metadata for the dropped table by querying the metadata DB.
-	// We use a try-catch because the metadata DB may not exist (e.g., in test environments).
+	// Clean up SIDRA metadata from the main DB
 	try {
-		DuckDB metadata_db("sidra_parser.db");
-		Connection con(metadata_db);
+		auto &db = DatabaseInstance::GetDatabase(input.context);
+		Connection con(db);
 
-		// Remove from sidra_current_window (views referencing this table's staging view)
-		con.Query("DELETE FROM sidra_current_window WHERE view_name LIKE 'sidra_staging_view_" + table_name + "';");
+		// Check if this table has SIDRA metadata
+		auto check = con.Query("SELECT name FROM sidra_tables WHERE name = '" + EscapeSingleQuotes(table_name) + "'");
+		if (check->HasError() || check->RowCount() == 0) {
+			return;
+		}
 
-		// Remove from sidra_view_constraints
-		con.Query("DELETE FROM sidra_view_constraints WHERE view_name = '" + table_name + "';");
+		// Clean up all metadata for the dropped table
+		con.Query("DELETE FROM sidra_current_window WHERE view_name LIKE 'sidra_staging_view_" +
+		          EscapeSingleQuotes(table_name) + "'");
+		con.Query("DELETE FROM sidra_view_constraints WHERE view_name = '" + EscapeSingleQuotes(table_name) + "'");
+		con.Query("DELETE FROM sidra_table_constraints WHERE table_name = '" + EscapeSingleQuotes(table_name) + "'");
+		con.Query("DELETE FROM sidra_tables WHERE name = '" + EscapeSingleQuotes(table_name) + "'");
+		con.Query("DELETE FROM sidra_tables WHERE name = 'sidra_staging_view_" + EscapeSingleQuotes(table_name) + "'");
+		con.Query("DELETE FROM sidra_tables WHERE name = 'sidra_centralized_view_" + EscapeSingleQuotes(table_name) +
+		          "'");
 
-		// Remove from sidra_table_constraints
-		con.Query("DELETE FROM sidra_table_constraints WHERE table_name = '" + table_name + "';");
-
-		// Remove from sidra_tables
-		con.Query("DELETE FROM sidra_tables WHERE name = '" + table_name + "';");
-
-		// Also remove derived entries (staging and centralized views)
-		con.Query("DELETE FROM sidra_tables WHERE name = 'sidra_staging_view_" + table_name + "';");
-		con.Query("DELETE FROM sidra_tables WHERE name = 'sidra_centralized_view_" + table_name + "';");
-		con.Query("DELETE FROM sidra_current_window WHERE view_name = 'sidra_staging_view_" + table_name + "';");
-
-		SERVER_DEBUG_PRINT("Cleaned up SIDRA metadata for dropped table: " + table_name);
+		SERVER_DEBUG_PRINT("Cleaned up SIDRA metadata for: " + table_name);
 	} catch (...) {
-		// Metadata DB doesn't exist or table has no SIDRA metadata — nothing to clean up
 		SERVER_DEBUG_PRINT("No SIDRA metadata to clean up for: " + table_name);
+	}
+
+	// Clean up the shadow DB
+	try {
+		string shadow_db_name = GetShadowDBName(input.context);
+		DuckDB shadow(shadow_db_name);
+		Connection shadow_con(shadow);
+		shadow_con.Query("DROP TABLE IF EXISTS " + table_name);
+		SERVER_DEBUG_PRINT("Dropped table from shadow DB: " + table_name);
+	} catch (...) {
+		SERVER_DEBUG_PRINT("No shadow DB cleanup needed for: " + table_name);
 	}
 }
 
