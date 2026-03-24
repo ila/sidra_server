@@ -5,41 +5,70 @@
 require server
 
 # ============================================================
-# Decentralized tables must have constraints
+# Table constraint validation
 # ============================================================
 
-# No constraints at all — rejected
+# No constraints at all
 statement error
 CREATE DECENTRALIZED TABLE t1 (id INT, city VARCHAR, steps INT);
 ----
 Decentralized tables must have privacy-preserving constraints
 
-# ============================================================
-# Decentralized tables must have at least one FACT column
-# ============================================================
-
-# Only SENSITIVE and DIMENSION, no FACT — rejected
+# No FACT column
 statement error
 CREATE DECENTRALIZED TABLE t2 (id INT SENSITIVE, city VARCHAR DIMENSION);
 ----
 Decentralized tables must have at least one FACT column
 
-# ============================================================
-# Decentralized tables must have at least one DIMENSION column
-# ============================================================
-
-# Only FACT, no DIMENSION — rejected
+# No DIMENSION column
 statement error
 CREATE DECENTRALIZED TABLE t3 (id INT, steps INT FACT);
 ----
 Decentralized tables must have at least one DIMENSION column
 
-# ============================================================
-# Only SENSITIVE is not enough
-# ============================================================
-
-# Only SENSITIVE — no FACT and no DIMENSION
+# Only SENSITIVE
 statement error
 CREATE DECENTRALIZED TABLE t4 (id INT SENSITIVE, city VARCHAR);
 ----
 Decentralized tables must have at least one FACT column
+
+# ============================================================
+# Setup: valid table for view tests
+# ============================================================
+
+statement ok
+CREATE DECENTRALIZED TABLE runs (nickname VARCHAR, city VARCHAR DIMENSION, steps INT FACT, hr INT SENSITIVE);
+
+# ============================================================
+# DMV must have aggregation
+# ============================================================
+
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW no_agg AS SELECT city FROM runs WINDOW 24 TTL 72 REFRESH 6;
+----
+must contain at least one aggregation
+
+# ============================================================
+# SENSITIVE in GROUP BY
+# ============================================================
+
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW sens_gb AS SELECT hr, SUM(steps) FROM runs GROUP BY hr WINDOW 24 TTL 72 REFRESH 6;
+----
+cannot be used in GROUP BY
+
+# ============================================================
+# FACT in GROUP BY
+# ============================================================
+
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW fact_gb AS SELECT steps, COUNT(*) FROM runs GROUP BY steps WINDOW 24 TTL 72 REFRESH 6;
+----
+cannot be used in GROUP BY
+
+# ============================================================
+# Valid DMV: DIMENSION in GROUP BY + FACT in SUM
+# ============================================================
+
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW good_view AS SELECT city, SUM(steps) AS total FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;

@@ -68,27 +68,14 @@ void ParseJSON(Connection &con, std::unordered_map<string, string> &config, int3
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
 
-	// Attempt to load config and initialize server tables (non-fatal if config missing)
-	string config_path = "";
-	string config_file = "server.config";
+	// Ensure metadata tables exist in the main DB
 	try {
-		auto config = ParseConfig(config_path, config_file);
-		SERVER_DEBUG_PRINT("Loaded server configuration");
-
 		DuckDB db(instance);
 		Connection con(db);
-
-		auto client_info = con.TableInfo("sidra_clients");
-		auto db_name = con.Query("select current_database();");
-		if (!db_name->HasError()) {
-			auto db_name_str = db_name->GetValue(0, 0).ToString();
-			if (!client_info && db_name_str == "sidra_parser") {
-				Printer::Print("Initializing server!");
-				InitializeServer(con, config_path, config);
-			}
-		}
-	} catch (const InvalidConfigurationException &) {
-		SERVER_DEBUG_PRINT("No server.config found, skipping server initialization");
+		EnsureMetadataTables(con);
+		SERVER_DEBUG_PRINT("SIDRA metadata tables initialized in main DB");
+	} catch (...) {
+		SERVER_DEBUG_PRINT("Could not initialize metadata tables (non-fatal at load time)");
 	}
 
 	// Register extension option for config path

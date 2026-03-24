@@ -24,8 +24,17 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
-static thread_local string g_sidra_pending_queries;
+static thread_local vector<string> g_sidra_main_queries;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
+static void ExecuteQueries(Connection &con, const vector<string> &queries, const string &error_prefix) {
+	for (auto &query : queries) {
+		auto result = con.Query(query);
+		if (result->HasError()) {
+			throw CatalogException(error_prefix + result->GetError());
+		}
+	}
+}
 
 //===--------------------------------------------------------------------===//
 // DDL executor — bind-phase execution
@@ -33,31 +42,21 @@ static thread_local string g_sidra_pending_queries;
 
 unique_ptr<FunctionData> SIDRADDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names) {
-	string queries = g_sidra_pending_queries;
-	g_sidra_pending_queries.clear();
+	auto main_queries = std::move(g_sidra_main_queries);
+	g_sidra_main_queries.clear();
 
-	if (!queries.empty()) {
-		// Execute each query in its own transaction via a separate connection
+	// Execute metadata inserts in the main DB
+	if (!main_queries.empty()) {
 		auto &db = DatabaseInstance::GetDatabase(context);
 		Connection conn(db);
-		auto query_list = StringUtil::Split(queries, ';');
-		for (auto &query : query_list) {
-			StringUtil::Trim(query);
-			if (query.empty()) {
-				continue;
-			}
-			auto result = conn.Query(query + ";");
-			if (result->HasError()) {
-				throw CatalogException("Failed to execute SIDRA DDL: " + result->GetError());
-			}
-		}
-		SERVER_DEBUG_PRINT("Executed compiled SIDRA queries in bind phase");
+		EnsureMetadataTables(conn);
+		ExecuteQueries(conn, main_queries, "Failed to execute SIDRA DDL: ");
+		SERVER_DEBUG_PRINT("Executed " + to_string(main_queries.size()) + " queries in main DB");
 	}
 
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.push_back("success");
-
-	return make_uniq<SIDRADDLBindData>(queries);
+	return make_uniq<SIDRADDLBindData>();
 }
 
 void SIDRADDLExecuteFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -187,35 +186,46 @@ static string ConstructTable(Connection &con, const string &view_name_in, bool i
 	return definition;
 }
 
-static string CompileTableCreation(Connection &con, SIDRAParseData &data) {
-	string metadata_queries;
+static vector<string> CompileTableCreation(Connection &shadow_con, SIDRAParseData &data) {
+	vector<string> metadata_queries;
 	auto &table_name = data.table_name;
 
+	// Ensure metadata tables exist in shadow DB for constraint lookups
+	EnsureMetadataTables(shadow_con);
+
+	// Validate the table creation in the shadow DB (all scopes)
+	auto r = shadow_con.Query(data.stripped_sql);
+	if (r->HasError()) {
+		throw ParserException("Error validating table: " + r->GetError());
+	}
+
+	// Metadata for main DB
+	metadata_queries.push_back("INSERT OR IGNORE INTO sidra_tables VALUES('" + EscapeSingleQuotes(table_name) + "', " +
+	                           to_string(static_cast<int32_t>(data.scope)) + ", NULL, 0)");
+
 	if (data.scope == TableScope::decentralized) {
-		// Validate the table creation in the parser DB
-		auto r = con.Query(data.stripped_sql);
-		if (r->HasError()) {
-			throw ParserException("Error validating table: " + r->GetError());
-		}
-
-		metadata_queries += "insert into sidra_tables values('" + EscapeSingleQuotes(table_name) + "', " +
-		                    to_string(static_cast<int32_t>(data.scope)) + ", NULL, 0);\n";
-
+		// Store constraints in shadow DB for future view validation
 		for (auto &[col_name, constraint] : data.table_constraints) {
-			metadata_queries += "insert into sidra_table_constraints values ('" + EscapeSingleQuotes(table_name) +
-			                    "', '" + EscapeSingleQuotes(col_name) + "', " + to_string(constraint.sensitive) + ", " +
-			                    to_string(constraint.fact) + ", " + to_string(constraint.dimension) + ");\n";
+			shadow_con.Query("INSERT OR REPLACE INTO sidra_table_constraints VALUES ('" +
+			                 EscapeSingleQuotes(table_name) + "', '" + EscapeSingleQuotes(col_name) + "', " +
+			                 to_string(constraint.sensitive) + ", " + to_string(constraint.fact) + ", " +
+			                 to_string(constraint.dimension) + ")");
 		}
-	} else {
-		metadata_queries += "insert into sidra_tables values('" + EscapeSingleQuotes(table_name) + "', " +
-		                    to_string(static_cast<int32_t>(data.scope)) + ", NULL, 0);\n";
+
+		// Constraint metadata for main DB
+		for (auto &[col_name, constraint] : data.table_constraints) {
+			metadata_queries.push_back("INSERT OR IGNORE INTO sidra_table_constraints VALUES ('" +
+			                           EscapeSingleQuotes(table_name) + "', '" + EscapeSingleQuotes(col_name) + "', " +
+			                           to_string(constraint.sensitive) + ", " + to_string(constraint.fact) + ", " +
+			                           to_string(constraint.dimension) + ")");
+		}
 	}
 
 	return metadata_queries;
 }
 
-static string CompileViewCreation(Connection &con, SIDRAParseData &data, const string &db_name) {
-	string metadata_queries;
+static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData &data) {
+	vector<string> metadata_queries;
 	auto &view_name = data.view_name;
 	auto &view_query = data.view_query;
 	auto &vc = data.view_constraint;
@@ -224,73 +234,59 @@ static string CompileViewCreation(Connection &con, SIDRAParseData &data, const s
 		throw ParserException("Views cannot start with sidra_staging_view_");
 	}
 
-	metadata_queries += "insert into sidra_tables values('" + EscapeSingleQuotes(view_name) + "', " +
-	                    to_string(static_cast<int32_t>(data.scope)) + ", '" + EscapeSingleQuotes(view_query) +
-	                    "', 1);\n";
+	metadata_queries.push_back("INSERT OR IGNORE INTO sidra_tables VALUES('" + EscapeSingleQuotes(view_name) + "', " +
+	                           to_string(static_cast<int32_t>(data.scope)) + ", '" + EscapeSingleQuotes(view_query) +
+	                           "', true)");
 
-	// Validate the view creation as a table in the parser DB
-	auto create_table_query = "create table " + view_name + " as " + view_query;
-	auto r = con.Query(create_table_query);
+	// Validate the view query in the shadow DB (which has table schemas)
+	auto create_table_query = "CREATE TABLE " + view_name + " AS " + view_query;
+	auto r = shadow_con.Query(create_table_query);
 	if (r->HasError()) {
 		throw ParserException("Error validating view: " + r->GetError());
 	}
 
 	if (data.scope == TableScope::centralized) {
-		auto view_constraint_str = "insert into sidra_view_constraints values('" + EscapeSingleQuotes(view_name) +
-		                           "', " + to_string(vc.refresh) + ", " + to_string(vc.ttl) + ", " +
-		                           to_string(vc.refresh) + ", " + to_string(vc.min_agg) + ", now());\n";
-		metadata_queries += view_constraint_str;
+		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_view_constraints VALUES('" +
+		                           EscapeSingleQuotes(view_name) + "', " + to_string(vc.refresh) + ", " +
+		                           to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " + to_string(vc.min_agg) +
+		                           ", now())");
 
 	} else if (data.scope == TableScope::decentralized) {
-		// Validate the view query against table constraints
-		// Fetch constraints of all tables referenced in the view
+		// Validate the view query against table constraints from shadow DB
 		unordered_map<string, SIDRAConstraints> all_constraints;
-		con.BeginTransaction();
-		try {
-			auto table_names = con.GetTableNames(view_query);
-			con.Rollback();
-
-			// Switch to metadata DB to look up constraints
-			auto constraints_query = "select column_name, sidra_sensitive, sidra_fact, sidra_dimension from "
-			                         "sidra_parser_internal.sidra_table_constraints";
-			auto constraints_result = con.Query(constraints_query);
-			if (!constraints_result->HasError()) {
-				for (idx_t i = 0; i < constraints_result->RowCount(); i++) {
-					string col_name = StringUtil::Lower(constraints_result->GetValue(0, i).ToString());
-					SIDRAConstraints c;
-					c.sensitive = constraints_result->GetValue(1, i).GetValue<bool>();
-					c.fact = constraints_result->GetValue(2, i).GetValue<bool>();
-					c.dimension = constraints_result->GetValue(3, i).GetValue<bool>();
-					all_constraints[col_name] = c;
-				}
+		auto constraints_result = shadow_con.Query(
+		    "SELECT column_name, sidra_sensitive, sidra_fact, sidra_dimension FROM sidra_table_constraints");
+		if (!constraints_result->HasError()) {
+			for (idx_t i = 0; i < constraints_result->RowCount(); i++) {
+				string col_name = StringUtil::Lower(constraints_result->GetValue(0, i).ToString());
+				SIDRAConstraints c;
+				c.sensitive = constraints_result->GetValue(1, i).GetValue<bool>();
+				c.fact = constraints_result->GetValue(2, i).GetValue<bool>();
+				c.dimension = constraints_result->GetValue(3, i).GetValue<bool>();
+				all_constraints[col_name] = c;
 			}
-		} catch (...) {
-			con.Rollback();
-			throw;
 		}
 
 		if (!all_constraints.empty()) {
-			CheckViewQueryConstraints(con, view_query, all_constraints);
+			CheckViewQueryConstraints(shadow_con, view_query, all_constraints);
 		}
 
-		metadata_queries += "insert into sidra_view_constraints values('" + EscapeSingleQuotes(view_name) + "', " +
-		                    to_string(vc.window) + ", " + to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " +
-		                    to_string(vc.min_agg) + ", now());\n";
-
-		metadata_queries += "insert into sidra_tables values('sidra_staging_view_" + EscapeSingleQuotes(view_name) +
-		                    "', " + to_string(static_cast<int32_t>(TableScope::centralized)) + ", NULL, 1);\n";
-
-		metadata_queries += "insert into sidra_tables values('sidra_centralized_view_" + EscapeSingleQuotes(view_name) +
-		                    "', " + to_string(static_cast<int32_t>(TableScope::centralized)) + ", NULL, 0);\n";
-
-		metadata_queries += "insert into sidra_current_window values('sidra_staging_view_" +
-		                    EscapeSingleQuotes(view_name) + "', 0, now());\n";
+		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_view_constraints VALUES('" +
+		                           EscapeSingleQuotes(view_name) + "', " + to_string(vc.window) + ", " +
+		                           to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " + to_string(vc.min_agg) +
+		                           ", now())");
+		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_tables VALUES('sidra_staging_view_" +
+		                           EscapeSingleQuotes(view_name) + "', " +
+		                           to_string(static_cast<int32_t>(TableScope::centralized)) + ", NULL, true)");
+		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_tables VALUES('sidra_centralized_view_" +
+		                           EscapeSingleQuotes(view_name) + "', " +
+		                           to_string(static_cast<int32_t>(TableScope::centralized)) + ", NULL, false)");
+		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_current_window VALUES('sidra_staging_view_" +
+		                           EscapeSingleQuotes(view_name) + "', 0, now())");
 
 	} else if (data.scope == TableScope::replicated) {
-		// Replicated views exist both centralized and decentralized
-		auto view_constraint_str = "insert into sidra_view_constraints values('" + EscapeSingleQuotes(view_name) +
-		                           "', 0, 0, " + to_string(vc.refresh) + ", 0, now());\n";
-		metadata_queries += view_constraint_str;
+		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_view_constraints VALUES('" +
+		                           EscapeSingleQuotes(view_name) + "', 0, 0, " + to_string(vc.refresh) + ", 0, now())");
 	}
 
 	return metadata_queries;
@@ -374,58 +370,21 @@ ParserExtensionPlanResult SIDRAParserExtension::SIDRAPlanFunction(ParserExtensio
 		config["db_name"] = "sidra_server.db";
 	}
 
-	// Compile metadata queries using the parser-internal DB for validation
-	string metadata_db_name = "sidra_parser.db";
-	DuckDB metadata_db(metadata_db_name);
-	Connection con(metadata_db);
+	// Open shadow DB for schema validation (persists table schemas across sessions)
+	string shadow_db_name = GetShadowDBName(context);
+	DuckDB shadow_db(shadow_db_name);
+	Connection shadow_con(shadow_db);
 
-	string db_name;
-	auto db_result = con.Query("select current_database();");
-	if (!db_result->HasError()) {
-		db_name = db_result->GetValue(0, 0).ToString();
+	// Compile: validate in shadow DB, produce metadata queries for main DB
+	vector<string> metadata_queries;
+	if (data.is_table) {
+		metadata_queries = CompileTableCreation(shadow_con, data);
+	} else if (data.is_view) {
+		metadata_queries = CompileViewCreation(shadow_con, data);
 	}
 
-	// Attach the parser-internal DB for schema validation
-	auto attach_r = con.Query("attach if not exists 'sidra_parser_internal.db' as sidra_parser_internal;");
-	if (attach_r->HasError()) {
-		throw ParserException("Error attaching parser DB: " + attach_r->GetError());
-	}
-	con.Query("use sidra_parser_internal");
-
-	string metadata_queries;
-	try {
-		if (data.is_table) {
-			metadata_queries = CompileTableCreation(con, data);
-		} else if (data.is_view) {
-			metadata_queries = CompileViewCreation(con, data, db_name);
-		}
-	} catch (...) {
-		// Clean up parser DB connection
-		con.Query("use " + db_name);
-		con.Query("detach sidra_parser_internal");
-		throw;
-	}
-
-	con.Query("use " + db_name);
-	con.Query("detach sidra_parser_internal");
-
-	// Build the full set of compiled queries to execute in bind phase
-	// This includes: the stripped DDL itself + metadata inserts
-	string all_queries;
-	if (!data.stripped_sql.empty()) {
-		all_queries += data.stripped_sql + "\n";
-	}
-	if (!metadata_queries.empty()) {
-		all_queries += metadata_queries;
-	}
-
-	// Store in thread-local for the bind function to pick up
-	g_sidra_pending_queries = all_queries;
-
-	// Write compiled queries to files for portability
-	if (!metadata_queries.empty()) {
-		WriteFile("metadata_queries.sql", false, metadata_queries);
-	}
+	// Store in thread-local for the bind function
+	g_sidra_main_queries = std::move(metadata_queries);
 
 	SERVER_DEBUG_PRINT("Compiled SIDRA DDL, deferring execution to bind phase");
 

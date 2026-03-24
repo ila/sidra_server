@@ -108,14 +108,14 @@ REFRESH is a required field
 # Edge cases — comments and whitespace
 # ============================================================
 
-# SQL with line comments should still be parsed
+# SQL with line comments
 statement error
 CREATE DECENTRALIZED MATERIALIZED VIEW test -- a comment
 AS SELECT 1 FROM t WINDOW 24 TTL 72;
 ----
 REFRESH is a required field
 
-# SQL with block comments should still be parsed
+# SQL with block comments
 statement error
 CREATE DECENTRALIZED MATERIALIZED VIEW test /* block comment */ AS SELECT 1 FROM t WINDOW 24 TTL 72;
 ----
@@ -136,3 +136,51 @@ statement error
 CREATE CENTRALIZED MATERIALIZED VIEW sidra_staging_view_test AS SELECT 1 FROM t REFRESH 6;
 ----
 Views cannot start with sidra_staging_view_
+
+# ============================================================
+# Complex view constraint combinations
+# ============================================================
+
+# WINDOW == TTL is allowed
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 TTL 24 REFRESH 6;
+----
+Error validating view
+
+# Centralized with MINIMUM AGGREGATION is valid syntax (validation error from missing table)
+statement error
+CREATE CENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t REFRESH 12 MINIMUM AGGREGATION 15;
+----
+Error validating view
+
+# ============================================================
+# Case insensitivity
+# ============================================================
+
+# Lowercase scope keywords
+statement error
+create decentralized materialized view test as select 1 from t window 24 ttl 72;
+----
+REFRESH is a required field
+
+# Mixed case
+statement error
+Create Decentralized Materialized View test AS Select 1 From t Window 24 Ttl 72;
+----
+REFRESH is a required field
+
+# ============================================================
+# Valid table creations
+# ============================================================
+
+# Centralized table (no constraints needed)
+statement ok
+CREATE CENTRALIZED TABLE region (code VARCHAR PRIMARY KEY, name VARCHAR);
+
+# Table with all three annotation types
+statement ok
+CREATE DECENTRALIZED TABLE full_annot (secret INT SENSITIVE, measure DECIMAL FACT, category VARCHAR DIMENSION);
+
+# Table with multiple FACT columns
+statement ok
+CREATE DECENTRALIZED TABLE multi_fact (id INT SENSITIVE, val INT FACT, city VARCHAR DIMENSION, x INT FACT);

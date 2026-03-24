@@ -63,11 +63,7 @@ public:
 //===--------------------------------------------------------------------===//
 
 struct SIDRADDLBindData : public TableFunctionData {
-	string compiled_queries;
-	bool executed;
-
-	explicit SIDRADDLBindData(string queries) : compiled_queries(std::move(queries)), executed(false) {
-	}
+	bool executed = false;
 };
 
 //! Bind function that executes compiled SIDRA DDL via a separate connection

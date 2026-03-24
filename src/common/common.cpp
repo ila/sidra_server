@@ -67,6 +67,50 @@ void CreateSystemTables(string &path, Connection &con) {
 	SERVER_DEBUG_PRINT("System tables created successfully");
 }
 
+void EnsureMetadataTables(Connection &con) {
+	// All DDL uses IF NOT EXISTS — safe to call repeatedly
+	static const char *SYSTEM_TABLE_DDL[] = {
+	    "CREATE TABLE IF NOT EXISTS sidra_clients(id UBIGINT PRIMARY KEY, creation TIMESTAMP, last_update TIMESTAMP)",
+	    "CREATE TABLE IF NOT EXISTS sidra_settings(setting VARCHAR PRIMARY KEY, value VARCHAR)",
+	    "CREATE TABLE IF NOT EXISTS sidra_tables(name VARCHAR PRIMARY KEY, type TINYINT, query VARCHAR, is_view "
+	    "BOOLEAN)",
+	    "CREATE TABLE IF NOT EXISTS sidra_clients_refreshes(id UBIGINT, table_name VARCHAR, last_result TIMESTAMP, "
+	    "last_refresh TIMESTAMP)",
+	    "CREATE TABLE IF NOT EXISTS sidra_table_constraints(table_name VARCHAR, column_name VARCHAR, sidra_sensitive "
+	    "BOOL, sidra_fact BOOL, sidra_dimension BOOL, PRIMARY KEY(table_name, column_name))",
+	    "CREATE TABLE IF NOT EXISTS sidra_view_constraints(view_name VARCHAR, sidra_window INT, sidra_ttl TINYINT, "
+	    "sidra_refresh TINYINT, sidra_min_agg TINYINT, last_refresh TIMESTAMP, PRIMARY KEY(view_name))",
+	    "CREATE TABLE IF NOT EXISTS sidra_current_window(view_name VARCHAR, sidra_window INT, last_update TIMESTAMP, "
+	    "PRIMARY KEY(view_name))",
+	};
+
+	for (auto &ddl : SYSTEM_TABLE_DDL) {
+		auto result = con.Query(ddl);
+		if (result->HasError()) {
+			throw ParserException("Error creating SIDRA system table: " + result->GetError());
+		}
+	}
+	SERVER_DEBUG_PRINT("SIDRA metadata tables ensured");
+}
+
+string GetShadowDBName(ClientContext &context) {
+	string db_name = "memory";
+	try {
+		auto &db_instance = DatabaseInstance::GetDatabase(context);
+		Connection con(db_instance);
+		auto result = con.Query("SELECT current_database()");
+		if (!result->HasError() && result->RowCount() > 0) {
+			auto name = result->GetValue(0, 0).ToString();
+			if (!name.empty() && name != ":memory:") {
+				db_name = name;
+			}
+		}
+	} catch (...) {
+		// fallback to "memory"
+	}
+	return "sidra_shadow_" + db_name + ".db";
+}
+
 void SendFile(std::unordered_map<string, string> &config, int32_t sock) {
 	string file_path = config["db_path"] + "profile_output.json";
 	int32_t fd = open(file_path.c_str(), O_RDONLY);
