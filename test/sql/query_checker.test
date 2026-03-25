@@ -153,6 +153,22 @@ SELECT view_name, sidra_window, sidra_refresh FROM sidra_view_constraints WHERE 
 daily_steps	24	6
 
 # ============================================================
+# Verify staging and centralized tables were created
+# ============================================================
+
+# Staging view table exists with metadata columns
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'sidra_staging_view_daily_steps';
+----
+1
+
+# Centralized view table exists with observability columns
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'sidra_centralized_view_daily_steps';
+----
+1
+
+# ============================================================
 # DROP TABLE cleans up metadata (centralized tables)
 # ============================================================
 

@@ -16,40 +16,47 @@ namespace duckdb {
 
 static int flush_run = 0; // benchmark run counter
 
-static string UpdateWithMinimumAggregation(string &centralized_view_name, string &centralized_table_name,
-                                           string &column_names, string &join_names, string &protected_column_names,
-                                           int minimum_aggregation) {
-	string query = "update " + centralized_view_name + " x\nset action = 2 \nfrom (\n\tselect ";
-	query += protected_column_names + ", ";
+static string UpdateWithMinimumAggregation(string &staging_view, string &centralized_table, string &column_names,
+                                           string &join_names, string &dimension_columns, int minimum_aggregation) {
+	// Match handwritten script pattern: mark rows meeting min_agg threshold,
+	// insert into centralized, delete marked from staging.
+	// Also filter by expired window (fixes TODO #51).
+	string query = "update " + staging_view + " x\nset action = 2 \nfrom (\n\tselect ";
+	query += dimension_columns + ", ";
 	query += "count(distinct client_id)\n\t";
-	query += "from " + centralized_view_name + " \n\t";
-	query += "group by " + protected_column_names + "\n\t";
+	query += "from " + staging_view + " \n\t";
+	query += "where sidra_window > (select expired_window from threshold_window)\n\t";
+	query += "group by " + dimension_columns + "\n\t";
 	query += "having count(distinct client_id) >= " + std::to_string(minimum_aggregation);
 	query += ") y\n";
 	query += "where " + join_names.substr(0, join_names.size() - 6) + ";\n\n";
-	query += "insert or replace into " + centralized_table_name + " by name\nselect " + column_names + " \nfrom " +
-	         centralized_view_name + " \nwhere action = 2;\n\n";
-	query += "delete from " + centralized_view_name + " \nwhere action = 2;\n\n";
+
+	query += "insert into " + centralized_table + " by name\nselect " + column_names + " \nfrom " + staging_view +
+	         " \nwhere action = 2;\n\n";
+	query += "delete from " + staging_view + " \nwhere action = 2;\n\n";
 
 	return query;
 }
 
-static string UpdateWithoutMinimumAggregation(string &centralized_view_name, string &centralized_table_name,
-                                              string &column_names) {
-	string query = "insert or replace into " + centralized_table_name + " by name \n";
+static string UpdateWithoutMinimumAggregation(string &staging_view, string &centralized_table, string &column_names,
+                                              const string &extract_metadata) {
+	// Insert all non-expired rows
+	string query = "insert into " + centralized_table + " by name \n";
 	query += "select " + column_names + "\n";
-	query += "from " + centralized_view_name + "\n";
+	query += "from " + staging_view + "\n";
 	query += "where sidra_window > (select expired_window from threshold_window);\n\n";
-	query += "delete from " + centralized_view_name + ";\n\n";
+
+	// Delete expired rows from staging (needs its own CTE since it's a separate statement)
+	query += extract_metadata;
+	query += "delete from " + staging_view + "\n";
+	query += "where sidra_window <= (select expired_window from threshold_window);\n\n";
+
 	return query;
 }
 
 void FlushFunction(ClientContext &context, const FunctionParameters &parameters) {
-	// TODO: implement refresh logic (insert or replace into)
 	// TODO: implement client deletes (opt out)
 	// TODO: add index logic for upsert
-	// TODO: check expired windows in 1st update with min agg
-	// TODO: only remove local (client) aggregations if the window elapses (not at every refresh)
 
 	auto database = StringValue::Get(parameters.values[1]);
 	if (database != "duckdb" && database != "postgres") {
@@ -65,24 +72,18 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	auto config = ParseConfig(config_path, config_file);
 
 	string server_db_name = config["db_name"];
-	string client_catalog_name = "sidra_client";
-	string client_db_name = "sidra_client.db";
-	string metadata_db_name = "sidra_parser.db";
+	// Everything (metadata, staging, centralized) is in the server DB
 	DuckDB server_db(server_db_name);
-	DuckDB client_db(client_db_name);
-	DuckDB metadata_db(metadata_db_name);
 	Connection server_con(server_db);
-	Connection client_con(client_db);
-	Connection metadata_con(metadata_db);
 
 	auto view_name = StringValue::Get(parameters.values[0]);
-	auto centralized_view_name = "sidra_staging_view_" + view_name;
-	auto centralized_table_name = "sidra_centralized_view_" + view_name;
+	auto staging_view = "sidra_staging_view_" + view_name;
+	auto centralized_table = "sidra_centralized_view_" + view_name;
 
 	LocalFileSystem fs;
+	string file_name = staging_view + "_flush.sql";
 
-	string file_name = centralized_view_name + "_flush.sql";
-
+	// If a pre-compiled flush script exists, execute it directly
 	if (fs.FileExists(file_name)) {
 		bool append = flush_run > 0;
 		string queries = ReadFile(file_name);
@@ -95,55 +96,54 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 		throw ParserException("View name cannot contain '_min_agg' - this is reserved for internal use!");
 	}
 
-	client_con.BeginTransaction();
-	auto centralized_view_catalog_entry =
-	    Catalog::GetEntry<TableCatalogEntry>(*client_con.context, client_catalog_name, "main", centralized_view_name,
-	                                         OnEntryNotFound::RETURN_NULL, QueryErrorContext());
-	client_con.Rollback();
-
-	if (!centralized_view_catalog_entry) {
-		throw ParserException("Centralized view not found: " + centralized_view_name);
+	// Look up the staging view in the server DB
+	auto staging_info = server_con.TableInfo(staging_view);
+	if (!staging_info) {
+		throw ParserException("Staging view not found: " + staging_view);
 	}
-	centralized_view_name = "sidra_client." + centralized_view_name;
-	centralized_table_name = server_db_name.substr(0, server_db_name.size() - 3) + "." + centralized_table_name;
 
-	string protected_column_names;
+	string dimension_columns;
 	string join_names;
 	string table_column_names;
 
+	// CTE to extract TTL metadata (metadata is in the server DB, not an external sidra_parser.db)
 	string extract_metadata = "WITH stats AS (\n"
-	                          "\tSELECT sidra_window, sidra_ttl FROM sidra_parser.sidra_view_constraints\n"
+	                          "\tSELECT sidra_window, sidra_ttl FROM sidra_view_constraints\n"
 	                          "\tWHERE view_name = '" +
-	                          view_name +
+	                          EscapeSingleQuotes(view_name) +
 	                          "'),\n"
 	                          "current_window AS (\n"
-	                          "\tSELECT sidra_window FROM sidra_parser.sidra_current_window\n"
+	                          "\tSELECT sidra_window FROM sidra_current_window\n"
 	                          "\tWHERE view_name = 'sidra_staging_view_" +
-	                          view_name +
+	                          EscapeSingleQuotes(view_name) +
 	                          "'),\n"
 	                          "threshold_window AS (\n"
 	                          "\tSELECT cw.sidra_window - (s.sidra_ttl / s.sidra_window) AS expired_window\n"
 	                          "\tFROM current_window cw, stats s)\n";
 
-	string min_agg_query = "select sidra_min_agg from sidra_view_constraints where view_name = '" + view_name + "';";
-	auto r = metadata_con.Query(min_agg_query);
+	// Query metadata from the server DB (not sidra_parser.db)
+	string min_agg_query =
+	    "select sidra_min_agg from sidra_view_constraints where view_name = '" + EscapeSingleQuotes(view_name) + "';";
+	auto r = server_con.Query(min_agg_query);
 	if (r->HasError()) {
-		throw ParserException("Error while querying columns metadata: " + r->GetError());
+		throw ParserException("Error while querying view metadata: " + r->GetError());
 	}
 	if (r->RowCount() == 0) {
-		throw ParserException("View metadata not found!");
+		throw ParserException("View metadata not found for: " + view_name);
 	}
 	auto minimum_aggregation = std::stoi(r->GetValue(0, 0).ToString());
 
-	string view_query = "select query from sidra_tables where name = '" + view_name + "';";
-	auto view_query_result = metadata_con.Query(view_query);
+	// Get the view query to find referenced tables
+	string view_query_sql = "select query from sidra_tables where name = '" + EscapeSingleQuotes(view_name) + "';";
+	auto view_query_result = server_con.Query(view_query_sql);
 	if (view_query_result->HasError()) {
 		throw ParserException("Error while querying view definition: " + view_query_result->GetError());
 	}
 
-	metadata_con.BeginTransaction();
-	auto table_names = metadata_con.GetTableNames(view_query_result->GetValue(0, 0).ToString());
-	metadata_con.Rollback();
+	// Find dimension columns from table constraints
+	server_con.BeginTransaction();
+	auto table_names = server_con.GetTableNames(view_query_result->GetValue(0, 0).ToString());
+	server_con.Rollback();
 
 	string in_table_names = "(";
 	for (auto &table : table_names) {
@@ -151,57 +151,58 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	}
 	in_table_names = in_table_names.substr(0, in_table_names.size() - 2) + ")";
 
-	auto protected_columns_query =
-	    "select column_name from sidra_table_constraints where sidra_dimension = 1 and table_name in " +
-	    in_table_names + ";";
-	auto protected_columns = metadata_con.Query(protected_columns_query);
-	if (protected_columns->HasError()) {
-		throw ParserException("Error while querying protected columns: " + protected_columns->GetError());
+	auto dim_columns_query = "select column_name from sidra_table_constraints where sidra_dimension = 1 "
+	                         "and table_name in " +
+	                         in_table_names + ";";
+	auto dim_columns = server_con.Query(dim_columns_query);
+	if (dim_columns->HasError()) {
+		throw ParserException("Error while querying dimension columns: " + dim_columns->GetError());
 	}
-	for (size_t i = 0; i < protected_columns->RowCount(); i++) {
-		auto column = protected_columns->GetValue(0, i).ToString();
-		protected_column_names += column + ", ";
+	for (size_t i = 0; i < dim_columns->RowCount(); i++) {
+		auto column = dim_columns->GetValue(0, i).ToString();
+		dimension_columns += column + ", ";
 		join_names += "x." + column + " = y." + column + " \nand ";
 	}
 
-	protected_column_names += "sidra_window";
+	dimension_columns += "sidra_window";
 	join_names += "x.sidra_window = y.sidra_window \nand ";
 
-	auto &centralized_view_entry = centralized_view_catalog_entry->Cast<TableCatalogEntry>();
-	for (auto &column : centralized_view_entry.GetColumns().GetColumnNames()) {
-		if (column != "action" && column != "generation" && column != "arrival") {
-			table_column_names += column + ", ";
+	// Get column names from the staging view (excluding metadata columns)
+	for (auto &column : staging_info->columns) {
+		auto col_name = column.GetName();
+		if (col_name != "action" && col_name != "generation" && col_name != "arrival") {
+			table_column_names += col_name + ", ";
 		}
 	}
 	table_column_names = table_column_names.substr(0, table_column_names.size() - 2);
 
+	// For DuckDB mode, everything is in one DB — no attach needed.
+	// For Postgres mode, attach the external DB.
 	string attach_query;
-	string attach_parser = "attach 'sidra_parser.db' as sidra_parser;\n\n";
-	string attach_parser_read_only = "attach 'sidra_parser.db' as sidra_parser (read_only);\n\n";
-	if (database == "duckdb") {
-		attach_query = "attach '" + client_db_name + "' as sidra_client;\n\n";
-	} else if (database == "postgres") {
+	string detach_query;
+	if (database == "postgres") {
 		// TODO: extend config to support postgres credentials
 		string postgres_credentials = "'dbname=sidra_client user=ubuntu password=test host=localhost'";
 		attach_query = "attach if not exists " + postgres_credentials + " as sidra_client (type postgres);\n\n";
+		detach_query = "detach sidra_client;\n\n";
 	}
 
-	string detach_query = "detach sidra_client;\n\n";
-
-	string update_query_1;
+	// Build the main data movement query
+	string update_query;
 	if (minimum_aggregation > 1) {
-		update_query_1 = UpdateWithMinimumAggregation(centralized_view_name, centralized_table_name, table_column_names,
-		                                              join_names, protected_column_names, minimum_aggregation);
+		update_query =
+		    extract_metadata + UpdateWithMinimumAggregation(staging_view, centralized_table, table_column_names,
+		                                                    join_names, dimension_columns, minimum_aggregation);
 	} else {
-		update_query_1 = extract_metadata + UpdateWithoutMinimumAggregation(centralized_view_name,
-		                                                                    centralized_table_name, table_column_names);
+		update_query = extract_metadata + UpdateWithoutMinimumAggregation(staging_view, centralized_table,
+		                                                                  table_column_names, extract_metadata);
 	}
 
+	// Build metric updates
 	string update_responsiveness = UpdateResponsiveness(view_name);
 	string update_completeness;
 	if (minimum_aggregation > 1) {
-		update_completeness = attach_parser_read_only + extract_metadata.substr(0, extract_metadata.size() - 1) +
-		                      UpdateCompleteness(view_name);
+		update_completeness = extract_metadata.substr(0, extract_metadata.size() - 1) + UpdateCompleteness(view_name);
 	} else {
 		update_completeness =
 		    "update sidra_centralized_view_" + view_name + " sidra_metadata_update\nset completeness = 100;\n\n";
@@ -213,22 +214,27 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 		update_buffer_size =
 		    "update sidra_centralized_view_" + view_name + " sidra_metadata_update\nset buffer_size = 0;\n\n";
 	}
-	string cleanup_expired_clients = CleanupExpiredClients(config);
+	string cleanup_clients = CleanupExpiredClients(config);
 
-	string delete_query_2;
+	// TTL cleanup in staging (only for min_agg path — non-min-agg already deletes expired)
+	string ttl_cleanup;
 	if (minimum_aggregation > 1) {
-		delete_query_2 = extract_metadata + "delete from " + centralized_view_name +
-		                 " where sidra_window <= (SELECT expired_window FROM threshold_window);\n\n";
+		ttl_cleanup = extract_metadata + "delete from " + staging_view +
+		              "\nwhere sidra_window <= (SELECT expired_window FROM threshold_window);\n\n";
 	}
 
+	// Zero aggregate cleanup (matching handwritten scripts)
+	string zero_cleanup = "delete from " + centralized_table + "\nwhere " +
+	                      table_column_names.substr(table_column_names.find_last_of(',') + 2) + " = 0;\n\n";
+
+	// Assemble the complete flush script
 	string queries;
 	if (database == "duckdb") {
-		queries = attach_query + attach_parser + update_query_1 + detach_query + cleanup_expired_clients +
-		          update_responsiveness + attach_query + update_completeness + delete_query_2 + update_buffer_size +
-		          detach_query;
+		queries = attach_query + update_query + detach_query + cleanup_clients + update_responsiveness + attach_query +
+		          update_completeness + ttl_cleanup + update_buffer_size + zero_cleanup + detach_query;
 	} else if (database == "postgres") {
-		queries = attach_query + attach_parser + update_query_1 + cleanup_expired_clients + update_responsiveness +
-		          update_completeness + delete_query_2 + update_buffer_size;
+		queries = attach_query + update_query + cleanup_clients + update_responsiveness + update_completeness +
+		          ttl_cleanup + update_buffer_size + zero_cleanup;
 	}
 
 	bool append = flush_run > 0;

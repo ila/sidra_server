@@ -271,6 +271,21 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 			CheckViewQueryConstraints(shadow_con, view_query, all_constraints);
 		}
 
+		// Create the staging view table (receives data from clients)
+		string staging_ddl = ConstructTable(shadow_con, view_name, true);
+		// Make it IF NOT EXISTS for idempotency
+		staging_ddl = std::regex_replace(staging_ddl, std::regex(R"(create table )", std::regex_constants::icase),
+		                                 "CREATE TABLE IF NOT EXISTS ");
+		metadata_queries.push_back(staging_ddl);
+
+		// Create the centralized view table (final aggregated result with metrics)
+		string centralized_ddl = ConstructTable(shadow_con, view_name, false);
+		centralized_ddl =
+		    std::regex_replace(centralized_ddl, std::regex(R"(create table )", std::regex_constants::icase),
+		                       "CREATE TABLE IF NOT EXISTS ");
+		metadata_queries.push_back(centralized_ddl);
+
+		// Metadata inserts
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_view_constraints VALUES('" +
 		                           EscapeSingleQuotes(view_name) + "', " + to_string(vc.window) + ", " +
 		                           to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " + to_string(vc.min_agg) +
@@ -387,6 +402,12 @@ ParserExtensionPlanResult SIDRAParserExtension::SIDRAPlanFunction(ParserExtensio
 	// (decentralized tables only exist in the shadow DB — they're virtual on the server)
 	if (data.is_table && data.scope != TableScope::decentralized && !data.stripped_sql.empty()) {
 		metadata_queries.insert(metadata_queries.begin(), data.stripped_sql);
+	}
+
+	// Write decentralized queries to file for client download
+	if (data.scope == TableScope::decentralized && !data.stripped_sql.empty()) {
+		WriteFile("decentralized_queries.sql", true, data.stripped_sql);
+		SERVER_DEBUG_PRINT("Appended to decentralized_queries.sql");
 	}
 
 	// Store in thread-local for the bind function

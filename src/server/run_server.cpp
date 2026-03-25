@@ -355,12 +355,11 @@ static void ClientThreadHandler(int connfd, unordered_map<string, string> &confi
 
 		SERVER_DEBUG_PRINT("Reading message: " + ToString(message) + "...");
 
-		string metadata_db_name = "sidra_parser.db";
-		string client_db_name = "sidra_client.db";
-		DuckDB metadata_db(metadata_db_name);
-		DuckDB client_db(client_db_name);
-		Connection metadata_con(metadata_db);
-		Connection client_con(client_db);
+		// Metadata and staging tables are in the server DB (from config)
+		string server_db_name = config["db_name"];
+		DuckDB db(server_db_name);
+		Connection metadata_con(db);
+		Connection client_con(db);
 
 		switch (message) {
 		case CLOSE_CONNECTION:
