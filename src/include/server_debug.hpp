@@ -4,7 +4,7 @@
 
 // Set to 1 to enable verbose server debug output, 0 to disable
 // This is separate from DuckDB's DEBUG macro to avoid cluttering test output
-#define SERVER_DEBUG 0
+#define SERVER_DEBUG 1
 
 #if SERVER_DEBUG
 #define SERVER_DEBUG_PRINT(x) Printer::Print(x)

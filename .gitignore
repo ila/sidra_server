@@ -6,3 +6,12 @@ duckdb_unittest_tempdir/
 testext
 test/python/__pycache__/
 .Rhistory
+
+# Generated files from testing (root only)
+/*.db
+/*.db.wal
+/*.duckdb_extension
+/*.log
+/*.csv
+/*.sql
+/*.pdf

@@ -105,8 +105,8 @@ string UpdateBufferSize(string &view_name) {
 string CleanupExpiredClients(std::unordered_map<string, string> &config) {
 	int keep_alive_days = std::stoi(config["keep_alive_clients_days"]);
 	// sidra_clients is in the main DB — no sidra_parser prefix needed
-	string query = "DELETE FROM sidra_clients WHERE last_update < current_date - interval " +
-	               std::to_string(keep_alive_days) + " day;\n\n";
+	string query = "DELETE FROM sidra_clients WHERE last_update < now()::TIMESTAMP - INTERVAL '" +
+	               std::to_string(keep_alive_days) + " days';\n\n";
 	return query;
 }
 

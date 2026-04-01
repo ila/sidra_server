@@ -71,10 +71,10 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	string config_file = "server.config";
 	auto config = ParseConfig(config_path, config_file);
 
-	string server_db_name = config["db_name"];
-	// Everything (metadata, staging, centralized) is in the server DB
-	DuckDB server_db(server_db_name);
-	Connection server_con(server_db);
+	// Use the caller's database connection — opening a separate DuckDB instance
+	// on the same file causes WAL isolation (writes aren't visible to the caller).
+	Connection server_con(*context.db);
+	string server_db_name = context.db->config.options.database_path;
 
 	auto view_name = StringValue::Get(parameters.values[0]);
 	auto staging_view = "sidra_staging_view_" + view_name;
@@ -94,6 +94,12 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 
 	if (view_name.find("_min_agg") != string::npos) {
 		throw ParserException("View name cannot contain '_min_agg' - this is reserved for internal use!");
+	}
+
+	SERVER_DEBUG_PRINT("[FLUSH] db=" + server_db_name + " staging=" + staging_view + " centralized=" + centralized_table);
+	auto staging_count = server_con.Query("SELECT COUNT(*) FROM " + staging_view);
+	if (!staging_count->HasError()) {
+		SERVER_DEBUG_PRINT("[FLUSH] staging rows: " + staging_count->GetValue(0, 0).ToString());
 	}
 
 	// Look up the staging view in the server DB

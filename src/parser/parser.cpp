@@ -121,13 +121,16 @@ void ExecuteCommitLogAndWriteQueries(Connection &con, const string &queries, con
 		auto hash = HashQuery(query);
 		auto start = std::chrono::high_resolution_clock::now();
 
+		SERVER_DEBUG_PRINT("[EXEC] " + query.substr(0, 80) + (query.size() > 80 ? "..." : ""));
 		con.BeginTransaction();
 		auto r = con.Query(query + ";");
 		if (r->HasError()) {
 			con.Rollback();
+			SERVER_DEBUG_PRINT("[EXEC] ERROR: " + r->GetError());
 			throw ParserException("Error executing query [" + query + "]: " + r->GetError());
 		}
 		con.Commit();
+		SERVER_DEBUG_PRINT("[EXEC] OK (" + to_string(r->Collection().Count()) + " result rows)");
 
 		auto end = std::chrono::high_resolution_clock::now();
 		std::chrono::duration<double, std::milli> elapsed = end - start;
@@ -389,6 +392,13 @@ ParserExtensionPlanResult SIDRAParserExtension::SIDRAPlanFunction(ParserExtensio
 	string shadow_db_name = GetShadowDBName(context);
 	DuckDB shadow_db(shadow_db_name);
 	Connection shadow_con(shadow_db);
+
+	// Warn if the main DB is in-memory — centralized tables will be lost on exit
+	auto &db_path = context.db->config.options.database_path;
+	if (db_path.empty() || db_path == ":memory:") {
+		Printer::Print("Warning: database is in-memory. Tables and views will be lost when the session ends. "
+		               "Use a persistent database file (e.g., duckdb mydb.db) to keep your data.");
+	}
 
 	// Compile: validate in shadow DB, produce metadata queries for main DB
 	vector<string> metadata_queries;
