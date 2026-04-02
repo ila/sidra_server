@@ -6,6 +6,7 @@
 #include "server_debug.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -241,20 +242,118 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 	                           to_string(static_cast<int32_t>(data.scope)) + ", '" + EscapeSingleQuotes(view_query) +
 	                           "', true)");
 
-	// Validate the view query in the shadow DB (which has table schemas)
-	auto create_table_query = "CREATE TABLE " + view_name + " AS " + view_query;
-	auto r = shadow_con.Query(create_table_query);
-	if (r->HasError()) {
-		throw ParserException("Error validating view: " + r->GetError());
-	}
-
 	if (data.scope == TableScope::centralized) {
+		// Compile CMV via OpenIVM in the shadow DB
+		auto load_r = shadow_con.Query("LOAD './openivm.duckdb_extension'");
+		if (load_r->HasError()) {
+			throw ParserException("Failed to load OpenIVM extension: " + load_r->GetError());
+		}
+		SERVER_DEBUG_PRINT("[CMV] OpenIVM loaded in shadow DB");
+
+		// OpenIVM compiles the MV: creates _ivm_data_<name>, delta tables, index, metadata
+		string create_mv = "CREATE MATERIALIZED VIEW " + view_name + " AS " + view_query;
+		auto mv_r = shadow_con.Query(create_mv);
+		if (mv_r->HasError()) {
+			throw ParserException("Error compiling centralized MV: " + mv_r->GetError());
+		}
+		SERVER_DEBUG_PRINT("[CMV] OpenIVM compiled MV in shadow DB");
+
+		// Trigger a refresh to capture OpenIVM's compiled SQL
+		// With cascade_mode != "off" (default "downstream"), this runs even with empty deltas.
+		// Set ivm_files_path so OpenIVM writes the complete SQL to a file.
+		string ivm_files_dir = "/tmp/sidra_ivm_compile";
+		shadow_con.Query("SET ivm_files_path = '" + ivm_files_dir + "'");
+		auto refresh_r = shadow_con.Query("PRAGMA ivm('" + EscapeSingleQuotes(view_name) + "')");
+		if (refresh_r->HasError()) {
+			throw ParserException("Error compiling IVM refresh queries: " + refresh_r->GetError());
+		}
+
+		// Read the compiled SQL from the file OpenIVM wrote
+		string ivm_file = ivm_files_dir + "/ivm_upsert_queries_" + view_name + ".sql";
+		string compiled_sql;
+		{
+			std::ifstream f(ivm_file);
+			if (f.is_open()) {
+				std::stringstream buf;
+				buf << f.rdbuf();
+				compiled_sql = buf.str();
+			}
+		}
+		if (compiled_sql.empty()) {
+			throw ParserException("Failed to read compiled IVM SQL from: " + ivm_file);
+		}
+		SERVER_DEBUG_PRINT("[CMV] OpenIVM compiled SQL:\n" + compiled_sql);
+
+		// Extract IVM type from OpenIVM metadata
+		// Column is 'type' (int8): 0=AGGREGATE_GROUP, 1=SIMPLE_AGGREGATE, 2=SIMPLE_PROJECTION, 3=FULL_REFRESH, 4=AGGREGATE_HAVING
+		static const char *IVM_TYPE_NAMES[] = {"AGGREGATE_GROUP", "SIMPLE_AGGREGATE", "SIMPLE_PROJECTION",
+		                                       "FULL_REFRESH", "AGGREGATE_HAVING"};
+		auto type_r = shadow_con.Query("SELECT type FROM _duckdb_ivm_views WHERE view_name = '" +
+		                               EscapeSingleQuotes(view_name) + "'");
+		string ivm_type = "UNKNOWN";
+		if (!type_r->HasError() && type_r->RowCount() > 0) {
+			auto type_val = type_r->GetValue(0, 0).GetValue<int8_t>();
+			if (type_val >= 0 && type_val <= 4) {
+				ivm_type = IVM_TYPE_NAMES[type_val];
+			}
+		}
+
+		// Get data table schema for creating CMV table on main DB
+		string ivm_data_table = "_ivm_data_" + view_name;
+		auto data_info = shadow_con.TableInfo(ivm_data_table);
+		if (!data_info) {
+			throw ParserException("OpenIVM data table not found: " + ivm_data_table);
+		}
+
+		// Find source view (DMV that this CMV references)
+		shadow_con.BeginTransaction();
+		auto source_tables = shadow_con.GetTableNames(view_query);
+		shadow_con.Rollback();
+		string source_view;
+		for (auto &t : source_tables) {
+			source_view = t;
+			break;
+		}
+		if (source_view.empty()) {
+			throw ParserException("Could not determine source view for CMV: " + view_name);
+		}
+
+		// Create CMV data table on main DB (same schema as OpenIVM's _ivm_data_*, minus internals)
+		string cmv_data_table = "sidra_cmv_data_" + view_name;
+		string cmv_ddl = "CREATE TABLE IF NOT EXISTS " + cmv_data_table + " (";
+		for (auto &col : data_info->columns) {
+			auto col_name = col.GetName();
+			if (col_name.find("_ivm_") == 0) {
+				continue;
+			}
+			cmv_ddl += col_name + " " + StringUtil::Lower(col.GetType().ToString()) + ", ";
+		}
+		cmv_ddl = cmv_ddl.substr(0, cmv_ddl.size() - 2) + ")";
+		metadata_queries.push_back(cmv_ddl);
+
+		// Store metadata
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_view_constraints VALUES('" +
 		                           EscapeSingleQuotes(view_name) + "', " + to_string(vc.refresh) + ", " +
 		                           to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " + to_string(vc.min_agg) +
 		                           ", now())");
 
+		// Store compiled IVM SQL for use during flush
+		metadata_queries.push_back(
+		    "INSERT OR IGNORE INTO sidra_cmv_queries VALUES('" + EscapeSingleQuotes(view_name) + "', '" +
+		    EscapeSingleQuotes(source_view) + "', '" + EscapeSingleQuotes(compiled_sql) + "', '" +
+		    EscapeSingleQuotes(cmv_data_table) + "', '" + EscapeSingleQuotes(ivm_type) + "', now())");
+
+		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type +
+		                   " source=" + source_view + " data_table=" + cmv_data_table + ")");
+
 	} else if (data.scope == TableScope::decentralized) {
+		// Validate the view query in the shadow DB (which has table schemas)
+		auto create_table_query = "CREATE TABLE " + view_name + " AS " + view_query;
+		auto r = shadow_con.Query(create_table_query);
+		if (r->HasError()) {
+			throw ParserException("Error validating view: " + r->GetError());
+		}
+
 		// Validate the view query against table constraints from shadow DB
 		unordered_map<string, SIDRAConstraints> all_constraints;
 		auto constraints_result = shadow_con.Query(
@@ -303,6 +402,13 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		                           EscapeSingleQuotes(view_name) + "', 0, now())");
 
 	} else if (data.scope == TableScope::replicated) {
+		// Validate the view query in the shadow DB
+		auto create_table_query = "CREATE TABLE " + view_name + " AS " + view_query;
+		auto r = shadow_con.Query(create_table_query);
+		if (r->HasError()) {
+			throw ParserException("Error validating view: " + r->GetError());
+		}
+
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_view_constraints VALUES('" +
 		                           EscapeSingleQuotes(view_name) + "', 0, 0, " + to_string(vc.refresh) + ", 0, now())");
 	}
@@ -390,7 +496,9 @@ ParserExtensionPlanResult SIDRAParserExtension::SIDRAPlanFunction(ParserExtensio
 
 	// Open shadow DB for schema validation (persists table schemas across sessions)
 	string shadow_db_name = GetShadowDBName(context);
-	DuckDB shadow_db(shadow_db_name);
+	DBConfig shadow_config;
+	shadow_config.SetOptionByName("allow_unsigned_extensions", Value(true));
+	DuckDB shadow_db(shadow_db_name, &shadow_config);
 	Connection shadow_con(shadow_db);
 
 	// Warn if the main DB is in-memory — centralized tables will be lost on exit
