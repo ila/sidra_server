@@ -81,4 +81,32 @@ void RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
 }
 
+// Functions needed by LPTS (logical_plan_to_sql.cpp)
+string VecToSeparatedList(vector<string> input_list, const string &separator) {
+	std::ostringstream ret_str;
+	for (size_t i = 0; i < input_list.size(); ++i) {
+		ret_str << input_list[i];
+		if (i != input_list.size() - 1) {
+			ret_str << separator;
+		}
+	}
+	return ret_str.str();
+}
+
+string SQLToLowercase(const string &sql) {
+	std::stringstream lowercase_stream;
+	bool in_string = false;
+	for (char c : sql) {
+		if (c == '\'') {
+			in_string = !in_string;
+		}
+		if (!in_string) {
+			lowercase_stream << static_cast<char>(tolower(c));
+		} else {
+			lowercase_stream << c;
+		}
+	}
+	return lowercase_stream.str();
+}
+
 } // namespace duckdb

@@ -5,11 +5,15 @@
 #include "parser_helpers.hpp"
 #include "server_debug.hpp"
 
+#include "logical_plan_to_sql.hpp"
+
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator_extension.hpp"
 #include "duckdb/planner/planner.hpp"
 
@@ -165,6 +169,57 @@ void ExecuteCommitAndWriteQueries(Connection &con, const string &queries, const 
 }
 
 //===--------------------------------------------------------------------===//
+// Plan manipulation helpers for CMV compilation
+//===--------------------------------------------------------------------===//
+
+//! Walk the plan tree and replace GET nodes that reference old_table with new_table
+static void RedirectGetNodes(unique_ptr<LogicalOperator> &op, const string &old_table, const string &new_table,
+                             ClientContext &context) {
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		if (get.GetTable().get() && get.GetTable()->name == old_table) {
+			auto catalog_name = get.GetTable()->catalog.GetName();
+			auto schema_name = get.GetTable()->schema.name;
+			QueryErrorContext error_context;
+			auto opt_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog_name, schema_name, new_table,
+			                                                      OnEntryNotFound::THROW_EXCEPTION, error_context);
+			auto &table_entry = opt_entry->Cast<TableCatalogEntry>();
+
+			unique_ptr<FunctionData> bind_data;
+			auto scan_function = table_entry.GetScanFunction(context, bind_data);
+
+			idx_t max_oid = 0;
+			for (auto &col : table_entry.GetColumns().Logical()) {
+				if (col.Oid() > max_oid) {
+					max_oid = col.Oid();
+				}
+			}
+			vector<LogicalType> return_types(max_oid + 1, LogicalType::ANY);
+			vector<string> return_names(max_oid + 1, "");
+			for (auto &col : table_entry.GetColumns().Logical()) {
+				return_types[col.Oid()] = col.Type();
+				return_names[col.Oid()] = col.Name();
+			}
+
+			auto new_get = make_uniq<LogicalGet>(get.table_index, scan_function, std::move(bind_data),
+			                                     std::move(return_types), std::move(return_names));
+			new_get->SetColumnIds(std::move(get.GetMutableColumnIds()));
+			new_get->projection_ids = std::move(get.projection_ids);
+			new_get->table_filters = std::move(get.table_filters);
+
+			SERVER_DEBUG_PRINT("[PLAN] Redirected GET: " + old_table + " -> " + new_table);
+			op = std::move(new_get);
+			return;
+		}
+	}
+	for (auto &child : op->children) {
+		RedirectGetNodes(child, old_table, new_table, context);
+	}
+}
+
+
+
+//===--------------------------------------------------------------------===//
 // Internal helpers for compilation
 //===--------------------------------------------------------------------===//
 
@@ -228,7 +283,8 @@ static vector<string> CompileTableCreation(Connection &shadow_con, SIDRAParseDat
 	return metadata_queries;
 }
 
-static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData &data) {
+static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData &data,
+                                          const string &shadow_db_name) {
 	vector<string> metadata_queries;
 	auto &view_name = data.view_name;
 	auto &view_query = data.view_query;
@@ -243,14 +299,13 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 	                           "', true)");
 
 	if (data.scope == TableScope::centralized) {
-		// Compile CMV via OpenIVM in the shadow DB
+		// Compile CMV: OpenIVM for MERGE template, plan traversal + LPTS for delta SQL
+
+		// Step 1: Load OpenIVM and compile MV in shadow DB
 		auto load_r = shadow_con.Query("LOAD './openivm.duckdb_extension'");
 		if (load_r->HasError()) {
 			throw ParserException("Failed to load OpenIVM extension: " + load_r->GetError());
 		}
-		SERVER_DEBUG_PRINT("[CMV] OpenIVM loaded in shadow DB");
-
-		// OpenIVM compiles the MV: creates _ivm_data_<name>, delta tables, index, metadata
 		string create_mv = "CREATE MATERIALIZED VIEW " + view_name + " AS " + view_query;
 		auto mv_r = shadow_con.Query(create_mv);
 		if (mv_r->HasError()) {
@@ -258,34 +313,7 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		}
 		SERVER_DEBUG_PRINT("[CMV] OpenIVM compiled MV in shadow DB");
 
-		// Trigger a refresh to capture OpenIVM's compiled SQL
-		// With cascade_mode != "off" (default "downstream"), this runs even with empty deltas.
-		// Set ivm_files_path so OpenIVM writes the complete SQL to a file.
-		string ivm_files_dir = "/tmp/sidra_ivm_compile";
-		shadow_con.Query("SET ivm_files_path = '" + ivm_files_dir + "'");
-		auto refresh_r = shadow_con.Query("PRAGMA ivm('" + EscapeSingleQuotes(view_name) + "')");
-		if (refresh_r->HasError()) {
-			throw ParserException("Error compiling IVM refresh queries: " + refresh_r->GetError());
-		}
-
-		// Read the compiled SQL from the file OpenIVM wrote
-		string ivm_file = ivm_files_dir + "/ivm_upsert_queries_" + view_name + ".sql";
-		string compiled_sql;
-		{
-			std::ifstream f(ivm_file);
-			if (f.is_open()) {
-				std::stringstream buf;
-				buf << f.rdbuf();
-				compiled_sql = buf.str();
-			}
-		}
-		if (compiled_sql.empty()) {
-			throw ParserException("Failed to read compiled IVM SQL from: " + ivm_file);
-		}
-		SERVER_DEBUG_PRINT("[CMV] OpenIVM compiled SQL:\n" + compiled_sql);
-
-		// Extract IVM type from OpenIVM metadata
-		// Column is 'type' (int8): 0=AGGREGATE_GROUP, 1=SIMPLE_AGGREGATE, 2=SIMPLE_PROJECTION, 3=FULL_REFRESH, 4=AGGREGATE_HAVING
+		// Step 2: Extract OpenIVM metadata
 		static const char *IVM_TYPE_NAMES[] = {"AGGREGATE_GROUP", "SIMPLE_AGGREGATE", "SIMPLE_PROJECTION",
 		                                       "FULL_REFRESH", "AGGREGATE_HAVING"};
 		auto type_r = shadow_con.Query("SELECT type FROM _duckdb_ivm_views WHERE view_name = '" +
@@ -298,14 +326,13 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 			}
 		}
 
-		// Get data table schema for creating CMV table on main DB
 		string ivm_data_table = "_ivm_data_" + view_name;
 		auto data_info = shadow_con.TableInfo(ivm_data_table);
 		if (!data_info) {
 			throw ParserException("OpenIVM data table not found: " + ivm_data_table);
 		}
 
-		// Find source view (DMV that this CMV references)
+		// Find source view (DMV referenced by CMV query)
 		shadow_con.BeginTransaction();
 		auto source_tables = shadow_con.GetTableNames(view_query);
 		shadow_con.Rollback();
@@ -317,9 +344,93 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		if (source_view.empty()) {
 			throw ParserException("Could not determine source view for CMV: " + view_name);
 		}
+		string staging_table = "sidra_staging_view_" + source_view;
 
-		// Create CMV data table on main DB (same schema as OpenIVM's _ivm_data_*, minus internals)
+		// Step 3: Plan the CMV query, walk the plan, replace GET nodes, call LPTS
+		// Strip wrapping from stored query
+		string clean_query = view_query;
+		StringUtil::Trim(clean_query);
+		if (!clean_query.empty() && clean_query.back() == ';') {
+			clean_query.pop_back();
+			StringUtil::Trim(clean_query);
+		}
+		if (!clean_query.empty() && clean_query.front() == '(' && clean_query.back() == ')') {
+			clean_query = clean_query.substr(1, clean_query.size() - 2);
+			StringUtil::Trim(clean_query);
+		}
+
+		// Plan in shadow DB where source table exists
+		duckdb::Parser query_parser;
+		query_parser.ParseQuery(clean_query);
+		shadow_con.BeginTransaction();
+		Planner planner(*shadow_con.context);
+		planner.CreatePlan(std::move(query_parser.statements[0]));
+		auto plan = std::move(planner.plan);
+
+		// Walk plan: replace GET(source_view) → GET(staging_table)
+		RedirectGetNodes(plan, source_view, staging_table, *shadow_con.context);
+
+		// Convert modified plan to SQL via LPTS (called from C++)
+		LogicalPlanToSql lpts(*shadow_con.context, plan);
+		auto cte_list = lpts.LogicalPlanToCteList();
+		string delta_sql = LogicalPlanToSql::CteListToSql(cte_list);
+		StringUtil::Trim(delta_sql);
+		if (!delta_sql.empty() && delta_sql.back() == ';') {
+			delta_sql.pop_back();
+		}
+		// Strip shadow DB catalog prefix (LPTS generates fully qualified names)
+		string shadow_catalog = shadow_db_name;
+		if (shadow_catalog.size() > 3 && shadow_catalog.substr(shadow_catalog.size() - 3) == ".db") {
+			shadow_catalog = shadow_catalog.substr(0, shadow_catalog.size() - 3);
+		}
+		delta_sql = StringUtil::Replace(delta_sql, shadow_catalog + ".main.", "");
+		shadow_con.Rollback();
+		SERVER_DEBUG_PRINT("[CMV] LPTS delta SQL:\n" + delta_sql);
+
+		// Step 4: Get MERGE template from OpenIVM
+		string ivm_files_dir = "/tmp/sidra_ivm_compile";
+		shadow_con.Query("SET ivm_files_path = '" + ivm_files_dir + "'");
+		shadow_con.Query("PRAGMA ivm('" + EscapeSingleQuotes(view_name) + "')");
+
+		string ivm_file = ivm_files_dir + "/ivm_upsert_queries_" + view_name + ".sql";
+		string compiled_ivm;
+		{
+			std::ifstream f(ivm_file);
+			if (f.is_open()) {
+				std::stringstream buf;
+				buf << f.rdbuf();
+				compiled_ivm = buf.str();
+			}
+		}
+
+		string merge_portion;
+		auto merge_pos = compiled_ivm.find("MERGE INTO");
+		if (merge_pos == string::npos) {
+			merge_pos = compiled_ivm.find("merge into");
+		}
+		if (merge_pos != string::npos) {
+			auto merge_end = compiled_ivm.find(';', merge_pos);
+			if (merge_end != string::npos) {
+				merge_portion = compiled_ivm.substr(merge_pos, merge_end - merge_pos);
+			}
+		}
+		if (merge_portion.empty()) {
+			throw ParserException("Could not extract MERGE from OpenIVM compiled SQL");
+		}
+
+		// Redirect MERGE table: _ivm_data_<name> → sidra_cmv_data_<name>
 		string cmv_data_table = "sidra_cmv_data_" + view_name;
+		merge_portion = StringUtil::Replace(merge_portion, ivm_data_table, cmv_data_table);
+
+		// Step 5: Assemble complete flush SQL
+		string having_clause;
+		if (vc.min_agg > 0) {
+			having_clause = " HAVING COUNT(DISTINCT client_id) >= " + to_string(static_cast<int>(vc.min_agg));
+		}
+		string flush_sql = "WITH ivm_cte AS (\n\t" + delta_sql + having_clause + "\n)\n" + merge_portion + ";\n";
+		SERVER_DEBUG_PRINT("[CMV] Assembled flush SQL:\n" + flush_sql);
+
+		// Step 6: Create CMV data table on main DB
 		string cmv_ddl = "CREATE TABLE IF NOT EXISTS " + cmv_data_table + " (";
 		for (auto &col : data_info->columns) {
 			auto col_name = col.GetName();
@@ -336,11 +447,9 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		                           EscapeSingleQuotes(view_name) + "', " + to_string(vc.refresh) + ", " +
 		                           to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " + to_string(vc.min_agg) +
 		                           ", now())");
-
-		// Store compiled IVM SQL for use during flush
 		metadata_queries.push_back(
 		    "INSERT OR IGNORE INTO sidra_cmv_queries VALUES('" + EscapeSingleQuotes(view_name) + "', '" +
-		    EscapeSingleQuotes(source_view) + "', '" + EscapeSingleQuotes(compiled_sql) + "', '" +
+		    EscapeSingleQuotes(source_view) + "', '" + EscapeSingleQuotes(flush_sql) + "', '" +
 		    EscapeSingleQuotes(cmv_data_table) + "', '" + EscapeSingleQuotes(ivm_type) + "', now())");
 
 		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type +
@@ -379,6 +488,9 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		staging_ddl = std::regex_replace(staging_ddl, std::regex(R"(create table )", std::regex_constants::icase),
 		                                 "CREATE TABLE IF NOT EXISTS ");
 		metadata_queries.push_back(staging_ddl);
+
+		// Also create staging table in shadow DB (needed for CMV plan traversal later)
+		shadow_con.Query(staging_ddl);
 
 		// Create the centralized view table (final aggregated result with metrics)
 		string centralized_ddl = ConstructTable(shadow_con, view_name, false);
@@ -513,7 +625,7 @@ ParserExtensionPlanResult SIDRAParserExtension::SIDRAPlanFunction(ParserExtensio
 	if (data.is_table) {
 		metadata_queries = CompileTableCreation(shadow_con, data);
 	} else if (data.is_view) {
-		metadata_queries = CompileViewCreation(shadow_con, data);
+		metadata_queries = CompileViewCreation(shadow_con, data, shadow_db_name);
 	}
 
 	// For centralized/replicated tables, also execute the DDL in the main DB

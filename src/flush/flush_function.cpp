@@ -246,6 +246,38 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	bool append = flush_run > 0;
 	ExecuteCommitLogAndWriteQueries(server_con, queries, file_name, view_name, append, flush_run, true);
 	flush_run++;
+
+	// Phase 3: Update dependent CMVs via IVM
+	// The compiled_merge_sql was generated at CREATE time via plan traversal + LPTS.
+	// It already references the staging table. We just execute it.
+	auto cmv_result = server_con.Query("SELECT view_name, compiled_merge_sql, data_table_name "
+	                                   "FROM sidra_cmv_queries WHERE source_view = '" +
+	                                   EscapeSingleQuotes(view_name) + "'");
+	if (cmv_result->HasError() || cmv_result->RowCount() == 0) {
+		return; // No dependent CMVs
+	}
+
+	for (idx_t i = 0; i < cmv_result->RowCount(); i++) {
+		string cmv_name = cmv_result->GetValue(0, i).ToString();
+		string compiled_sql = cmv_result->GetValue(1, i).ToString();
+		string cmv_data_table = cmv_result->GetValue(2, i).ToString();
+
+		SERVER_DEBUG_PRINT("[CMV FLUSH] Executing pre-compiled IVM for: " + cmv_name);
+		SERVER_DEBUG_PRINT("[CMV FLUSH] SQL:\n" + compiled_sql);
+
+		server_con.BeginTransaction();
+		auto cmv_r = server_con.Query(compiled_sql);
+		if (cmv_r->HasError()) {
+			server_con.Rollback();
+			SERVER_DEBUG_PRINT("[CMV FLUSH] ERROR: " + cmv_r->GetError());
+			Printer::Print("Warning: CMV update failed for " + cmv_name + ": " + cmv_r->GetError());
+		} else {
+			server_con.Commit();
+			server_con.Query("UPDATE sidra_cmv_queries SET last_flush = now() WHERE view_name = '" +
+			                 EscapeSingleQuotes(cmv_name) + "'");
+			SERVER_DEBUG_PRINT("[CMV FLUSH] Successfully updated CMV: " + cmv_name);
+		}
+	}
 }
 
 } // namespace duckdb

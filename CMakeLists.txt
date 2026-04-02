@@ -21,7 +21,9 @@ set(EXTENSION_SOURCES
     src/parser/parser_helpers.cpp
     src/optimizer/optimizer.cpp
     src/compiler/compiler_utils.cpp
-    src/compiler/generate_python_script.cpp)
+    src/compiler/generate_python_script.cpp
+    # LPTS — called from C++ for plan-to-SQL conversion
+    ${LPTS_DIR}/src/logical_plan_to_sql.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
