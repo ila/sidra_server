@@ -13,6 +13,13 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/function/aggregate/distributive_functions.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator_extension.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -217,7 +224,121 @@ static void RedirectGetNodes(unique_ptr<LogicalOperator> &op, const string &old_
 	}
 }
 
+//! Add client_id to the GET node's output and return its OUTPUT binding position.
+//! Returns the ColumnBinding that can be used by parent nodes to reference client_id.
+static ColumnBinding AddClientIdToGet(unique_ptr<LogicalOperator> &op) {
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		// Find client_id's schema position in the table
+		idx_t schema_idx = DConstants::INVALID_INDEX;
+		for (idx_t i = 0; i < get.names.size(); i++) {
+			if (get.names[i] == "client_id") {
+				schema_idx = i;
+				break;
+			}
+		}
+		if (schema_idx == DConstants::INVALID_INDEX) {
+			return ColumnBinding();
+		}
 
+		// Check if already in column_ids
+		auto &col_ids = get.GetMutableColumnIds();
+		for (idx_t i = 0; i < col_ids.size(); i++) {
+			if (!col_ids[i].IsRowIdColumn() && col_ids[i].GetPrimaryIndex() == schema_idx) {
+				// Already present — return its output position
+				idx_t output_pos = i;
+				if (!get.projection_ids.empty()) {
+					// With projection_ids, find which output maps to this column_ids entry
+					for (idx_t j = 0; j < get.projection_ids.size(); j++) {
+						if (get.projection_ids[j] == i) {
+							output_pos = j;
+							break;
+						}
+					}
+				}
+				return ColumnBinding(get.table_index, output_pos);
+			}
+		}
+
+		// Add client_id to column_ids
+		idx_t new_col_ids_pos = col_ids.size();
+		col_ids.push_back(ColumnIndex(schema_idx));
+
+		// If projection_ids is used, add a mapping for the new column
+		idx_t output_pos = new_col_ids_pos;
+		if (!get.projection_ids.empty()) {
+			output_pos = get.projection_ids.size();
+			get.projection_ids.push_back(new_col_ids_pos);
+		}
+
+		SERVER_DEBUG_PRINT("[PLAN] Added client_id to GET output at position " + to_string(output_pos));
+		return ColumnBinding(get.table_index, output_pos);
+	}
+	for (auto &child : op->children) {
+		auto result = AddClientIdToGet(child);
+		if (result.table_index != DConstants::INVALID_INDEX) {
+			return result;
+		}
+	}
+	return ColumnBinding();
+}
+
+//! Inject COUNT(DISTINCT client_id) >= min_agg as a HAVING filter into the AGGREGATE node.
+//! client_id_binding is the ColumnBinding from the GET node's output.
+static void InjectMinAggHaving(unique_ptr<LogicalOperator> &op, unique_ptr<LogicalOperator> &root, int min_agg,
+                               ColumnBinding client_id_binding, ClientContext &context) {
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &agg = op->Cast<LogicalAggregate>();
+
+		// Create BoundColumnRef for client_id using its GET output binding
+		auto client_id_ref = make_uniq<BoundColumnRefExpression>(LogicalType::UBIGINT, client_id_binding);
+
+		// Create COUNT(DISTINCT client_id) aggregate expression
+		vector<unique_ptr<Expression>> count_children;
+		count_children.push_back(std::move(client_id_ref));
+		auto count_functions = CountFun::GetFunctions();
+		auto count_func = count_functions.GetFunctionByArguments(context, {LogicalType::UBIGINT});
+		auto count_distinct = make_uniq<BoundAggregateExpression>(count_func, std::move(count_children), nullptr,
+		                                                          nullptr, AggregateType::DISTINCT);
+
+		agg.expressions.push_back(std::move(count_distinct));
+		idx_t count_agg_idx = agg.expressions.size() - 1;
+
+		// Create HAVING filter: COUNT(DISTINCT client_id) >= min_agg
+		auto having_ref =
+		    make_uniq<BoundColumnRefExpression>(LogicalType::BIGINT, ColumnBinding(agg.aggregate_index, count_agg_idx));
+		auto threshold = make_uniq<BoundConstantExpression>(Value::BIGINT(min_agg));
+		auto comparison = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+		                                                       std::move(having_ref), std::move(threshold));
+
+		// Insert FILTER node between aggregate's parent and the aggregate
+		std::function<bool(unique_ptr<LogicalOperator> &)> insert_filter;
+		insert_filter = [&](unique_ptr<LogicalOperator> &parent) -> bool {
+			for (auto &child : parent->children) {
+				if (child.get() == &agg) {
+					auto filter = make_uniq<LogicalFilter>();
+					filter->expressions.push_back(std::move(comparison));
+					filter->children.push_back(std::move(child));
+					child = std::move(filter);
+					return true;
+				}
+				if (insert_filter(child)) {
+					return true;
+				}
+			}
+			return false;
+		};
+		if (!insert_filter(root)) {
+			SERVER_DEBUG_PRINT("[PLAN] WARNING: Could not insert HAVING filter");
+		} else {
+			SERVER_DEBUG_PRINT("[PLAN] Injected HAVING COUNT(DISTINCT client_id) >= " + to_string(min_agg));
+		}
+		return;
+	}
+	for (auto &child : op->children) {
+		InjectMinAggHaving(child, root, min_agg, client_id_binding, context);
+	}
+}
 
 //===--------------------------------------------------------------------===//
 // Internal helpers for compilation
@@ -283,8 +404,7 @@ static vector<string> CompileTableCreation(Connection &shadow_con, SIDRAParseDat
 	return metadata_queries;
 }
 
-static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData &data,
-                                          const string &shadow_db_name) {
+static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData &data, const string &shadow_db_name) {
 	vector<string> metadata_queries;
 	auto &view_name = data.view_name;
 	auto &view_query = data.view_query;
@@ -370,7 +490,18 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		// Walk plan: replace GET(source_view) → GET(staging_table)
 		RedirectGetNodes(plan, source_view, staging_table, *shadow_con.context);
 
+		// Inject HAVING COUNT(DISTINCT client_id) >= min_agg at the plan level
+		if (vc.min_agg > 0) {
+			auto client_id_binding = AddClientIdToGet(plan);
+			if (client_id_binding.table_index != DConstants::INVALID_INDEX) {
+				InjectMinAggHaving(plan, plan, static_cast<int>(vc.min_agg), client_id_binding, *shadow_con.context);
+			} else {
+				SERVER_DEBUG_PRINT("[CMV] WARNING: client_id not found in staging table");
+			}
+		}
+
 		// Convert modified plan to SQL via LPTS (called from C++)
+		// Pass planner.names so LPTS preserves original column aliases (city, total_steps)
 		LogicalPlanToSql lpts(*shadow_con.context, plan);
 		auto cte_list = lpts.LogicalPlanToCteList();
 		string delta_sql = LogicalPlanToSql::CteListToSql(cte_list);
@@ -422,12 +553,8 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		string cmv_data_table = "sidra_cmv_data_" + view_name;
 		merge_portion = StringUtil::Replace(merge_portion, ivm_data_table, cmv_data_table);
 
-		// Step 5: Assemble complete flush SQL
-		string having_clause;
-		if (vc.min_agg > 0) {
-			having_clause = " HAVING COUNT(DISTINCT client_id) >= " + to_string(static_cast<int>(vc.min_agg));
-		}
-		string flush_sql = "WITH ivm_cte AS (\n\t" + delta_sql + having_clause + "\n)\n" + merge_portion + ";\n";
+		// Step 5: Assemble complete flush SQL (HAVING is already in the plan via LPTS)
+		string flush_sql = "WITH ivm_cte AS (\n\t" + delta_sql + "\n)\n" + merge_portion + ";\n";
 		SERVER_DEBUG_PRINT("[CMV] Assembled flush SQL:\n" + flush_sql);
 
 		// Step 6: Create CMV data table on main DB
@@ -447,13 +574,13 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		                           EscapeSingleQuotes(view_name) + "', " + to_string(vc.refresh) + ", " +
 		                           to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " + to_string(vc.min_agg) +
 		                           ", now())");
-		metadata_queries.push_back(
-		    "INSERT OR IGNORE INTO sidra_cmv_queries VALUES('" + EscapeSingleQuotes(view_name) + "', '" +
-		    EscapeSingleQuotes(source_view) + "', '" + EscapeSingleQuotes(flush_sql) + "', '" +
-		    EscapeSingleQuotes(cmv_data_table) + "', '" + EscapeSingleQuotes(ivm_type) + "', now())");
+		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_cmv_queries VALUES('" + EscapeSingleQuotes(view_name) +
+		                           "', '" + EscapeSingleQuotes(source_view) + "', '" + EscapeSingleQuotes(flush_sql) +
+		                           "', '" + EscapeSingleQuotes(cmv_data_table) + "', '" + EscapeSingleQuotes(ivm_type) +
+		                           "', now())");
 
-		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type +
-		                   " source=" + source_view + " data_table=" + cmv_data_table + ")");
+		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type + " source=" + source_view +
+		                   " data_table=" + cmv_data_table + ")");
 
 	} else if (data.scope == TableScope::decentralized) {
 		// Validate the view query in the shadow DB (which has table schemas)

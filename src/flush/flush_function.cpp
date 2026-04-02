@@ -96,7 +96,8 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 		throw ParserException("View name cannot contain '_min_agg' - this is reserved for internal use!");
 	}
 
-	SERVER_DEBUG_PRINT("[FLUSH] db=" + server_db_name + " staging=" + staging_view + " centralized=" + centralized_table);
+	SERVER_DEBUG_PRINT("[FLUSH] db=" + server_db_name + " staging=" + staging_view +
+	                   " centralized=" + centralized_table);
 	auto staging_count = server_con.Query("SELECT COUNT(*) FROM " + staging_view);
 	if (!staging_count->HasError()) {
 		SERVER_DEBUG_PRINT("[FLUSH] staging rows: " + staging_count->GetValue(0, 0).ToString());

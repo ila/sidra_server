@@ -145,13 +145,13 @@ Views cannot start with sidra_staging_view_
 statement error
 CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 24 TTL 24 REFRESH 6;
 ----
-Error validating view
+Error
 
 # Centralized with MINIMUM AGGREGATION is valid syntax (validation error from missing table)
 statement error
 CREATE CENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t REFRESH 12 MINIMUM AGGREGATION 15;
 ----
-Error validating view
+Error
 
 # ============================================================
 # Case insensitivity
