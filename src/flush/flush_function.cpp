@@ -271,9 +271,13 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	// Phase 3: Update dependent CMVs via IVM
 	// The compiled_merge_sql was generated at CREATE time via plan traversal + LPTS.
 	// It already references the staging table. We just execute it.
-	auto cmv_result = server_con.Query("SELECT view_name, compiled_merge_sql, data_table_name "
-	                                   "FROM sidra_cmv_queries WHERE source_view = '" +
-	                                   EscapeSingleQuotes(view_name) + "'");
+	// Find CMVs that depend on this view (source_view is comma-separated list)
+	auto cmv_result =
+	    server_con.Query("SELECT view_name, compiled_merge_sql, data_table_name "
+	                     "FROM sidra_cmv_queries WHERE source_view = '" +
+	                     EscapeSingleQuotes(view_name) + "' OR source_view LIKE '" + EscapeSingleQuotes(view_name) +
+	                     ",%' OR source_view LIKE '%," + EscapeSingleQuotes(view_name) + "' OR source_view LIKE '%," +
+	                     EscapeSingleQuotes(view_name) + ",%'");
 	if (cmv_result->HasError() || cmv_result->RowCount() == 0) {
 		return; // No dependent CMVs
 	}

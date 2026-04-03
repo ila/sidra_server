@@ -452,19 +452,31 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 			throw ParserException("OpenIVM data table not found: " + ivm_data_table);
 		}
 
-		// Find source view (DMV referenced by CMV query)
+		// Find ALL source views (DMVs referenced by CMV query)
 		shadow_con.BeginTransaction();
 		auto source_tables = shadow_con.GetTableNames(view_query);
 		shadow_con.Rollback();
-		string source_view;
+		vector<string> source_views;
 		for (auto &t : source_tables) {
-			source_view = t;
-			break;
+			// Check if this table has a staging view (i.e., it's a DMV)
+			auto staging_check = shadow_con.TableInfo("sidra_staging_view_" + t);
+			if (staging_check) {
+				source_views.push_back(t);
+			}
 		}
-		if (source_view.empty()) {
-			throw ParserException("Could not determine source view for CMV: " + view_name);
+		if (source_views.empty()) {
+			throw ParserException("Could not determine source views for CMV: " + view_name);
 		}
-		string staging_table = "sidra_staging_view_" + source_view;
+		// Comma-separated list of source views for metadata storage
+		string source_views_str;
+		for (size_t i = 0; i < source_views.size(); i++) {
+			if (i > 0) {
+				source_views_str += ",";
+			}
+			source_views_str += source_views[i];
+		}
+		// Use first source for backward compat in single-source case
+		string staging_table = "sidra_staging_view_" + source_views[0];
 
 		// Step 3: Plan the CMV query, walk the plan, replace GET nodes, call LPTS
 		// Strip wrapping from stored query
@@ -487,8 +499,10 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		planner.CreatePlan(std::move(query_parser.statements[0]));
 		auto plan = std::move(planner.plan);
 
-		// Walk plan: replace GET(source_view) → GET(staging_table)
-		RedirectGetNodes(plan, source_view, staging_table, *shadow_con.context);
+		// Walk plan: replace GET(source_view) → GET(staging_table) for ALL source views
+		for (auto &sv : source_views) {
+			RedirectGetNodes(plan, sv, "sidra_staging_view_" + sv, *shadow_con.context);
+		}
 
 		// Inject HAVING COUNT(DISTINCT client_id) >= min_agg at the plan level
 		if (vc.min_agg > 0) {
@@ -575,9 +589,9 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		                           to_string(vc.ttl) + ", " + to_string(vc.refresh) + ", " + to_string(vc.min_agg) +
 		                           ", now())");
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_cmv_queries VALUES('" + EscapeSingleQuotes(view_name) +
-		                           "', '" + EscapeSingleQuotes(source_view) + "', '" + EscapeSingleQuotes(flush_sql) +
-		                           "', '" + EscapeSingleQuotes(cmv_data_table) + "', '" + EscapeSingleQuotes(ivm_type) +
-		                           "', now())");
+		                           "', '" + EscapeSingleQuotes(source_views_str) + "', '" +
+		                           EscapeSingleQuotes(flush_sql) + "', '" + EscapeSingleQuotes(cmv_data_table) +
+		                           "', '" + EscapeSingleQuotes(ivm_type) + "', now())");
 
 		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type + " source=" + source_view +
 		                   " data_table=" + cmv_data_table + ")");
