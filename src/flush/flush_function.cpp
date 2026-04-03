@@ -40,11 +40,12 @@ static string UpdateWithMinimumAggregation(string &staging_view, string &central
 
 static string UpdateWithoutMinimumAggregation(string &staging_view, string &centralized_table, string &column_names,
                                               const string &extract_metadata) {
-	// Insert all non-expired rows
+	// Insert non-expired rows that arrived AFTER last flush (avoid re-processing)
 	string query = "insert into " + centralized_table + " by name \n";
 	query += "select " + column_names + "\n";
 	query += "from " + staging_view + "\n";
-	query += "where sidra_window > (select expired_window from threshold_window);\n\n";
+	query += "where sidra_window > (select expired_window from threshold_window)\n";
+	query += "and arrival > (select last_refresh from stats);\n\n";
 
 	// Delete expired rows from staging (needs its own CTE since it's a separate statement)
 	query += extract_metadata;
@@ -115,7 +116,7 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 
 	// CTE to extract TTL metadata (metadata is in the server DB, not an external sidra_parser.db)
 	string extract_metadata = "WITH stats AS (\n"
-	                          "\tSELECT sidra_window, sidra_ttl FROM sidra_view_constraints\n"
+	                          "\tSELECT sidra_window, sidra_ttl, last_refresh FROM sidra_view_constraints\n"
 	                          "\tWHERE view_name = '" +
 	                          EscapeSingleQuotes(view_name) +
 	                          "'),\n"
@@ -147,7 +148,17 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 		throw ParserException("Error while querying view definition: " + view_query_result->GetError());
 	}
 
-	// Find dimension columns from table constraints
+	// Find dimension columns: columns in the staging view that are DIMENSION-annotated
+	// AND actually present in the view's output (not all base table dimensions)
+	unordered_set<string> staging_columns;
+	for (auto &column : staging_info->columns) {
+		auto col_name = column.GetName();
+		if (col_name != "action" && col_name != "generation" && col_name != "arrival" && col_name != "sidra_window" &&
+		    col_name != "client_id") {
+			staging_columns.insert(col_name);
+		}
+	}
+
 	server_con.BeginTransaction();
 	auto table_names = server_con.GetTableNames(view_query_result->GetValue(0, 0).ToString());
 	server_con.Rollback();
@@ -167,8 +178,11 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	}
 	for (size_t i = 0; i < dim_columns->RowCount(); i++) {
 		auto column = dim_columns->GetValue(0, i).ToString();
-		dimension_columns += column + ", ";
-		join_names += "x." + column + " = y." + column + " \nand ";
+		// Only include dimension columns that are actually in the staging view
+		if (staging_columns.count(column)) {
+			dimension_columns += column + ", ";
+			join_names += "x." + column + " = y." + column + " \nand ";
+		}
 	}
 
 	dimension_columns += "sidra_window";
@@ -234,14 +248,20 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	string zero_cleanup = "delete from " + centralized_table + "\nwhere " +
 	                      table_column_names.substr(table_column_names.find_last_of(',') + 2) + " = 0;\n\n";
 
+	// Update last_refresh timestamp so next flush only processes new arrivals
+	string update_last_refresh =
+	    "UPDATE sidra_view_constraints SET last_refresh = now()::TIMESTAMP WHERE view_name = '" +
+	    EscapeSingleQuotes(view_name) + "';\n\n";
+
 	// Assemble the complete flush script
 	string queries;
 	if (database == "duckdb") {
 		queries = attach_query + update_query + detach_query + cleanup_clients + update_responsiveness + attach_query +
-		          update_completeness + ttl_cleanup + update_buffer_size + zero_cleanup + detach_query;
+		          update_completeness + ttl_cleanup + update_buffer_size + zero_cleanup + update_last_refresh +
+		          detach_query;
 	} else if (database == "postgres") {
 		queries = attach_query + update_query + cleanup_clients + update_responsiveness + update_completeness +
-		          ttl_cleanup + update_buffer_size + zero_cleanup;
+		          ttl_cleanup + update_buffer_size + zero_cleanup + update_last_refresh;
 	}
 
 	bool append = flush_run > 0;
