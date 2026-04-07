@@ -464,7 +464,72 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 			throw ParserException("Failed to load OpenIVM extension: " + load_r->GetError());
 		}
 
-		string create_mv = "CREATE MATERIALIZED VIEW " + view_name + " AS " + view_query;
+		// Inject sidra_window into the CMV query so OpenIVM groups by window natively.
+		// TODO: do this at the plan level once LPTS supports CTE_SCAN round-trip.
+		string cmv_query = view_query;
+		StringUtil::Trim(cmv_query);
+		if (!cmv_query.empty() && cmv_query.back() == ';') {
+			cmv_query.pop_back();
+			StringUtil::Trim(cmv_query);
+		}
+		if (!cmv_query.empty() && cmv_query.front() == '(' && cmv_query.back() == ')') {
+			cmv_query = cmv_query.substr(1, cmv_query.size() - 2);
+			StringUtil::Trim(cmv_query);
+		}
+
+		// Find the source DMVs and redirect to staging views (which have sidra_window)
+		shadow_con.BeginTransaction();
+		auto src_tables = shadow_con.GetTableNames(cmv_query);
+		shadow_con.Rollback();
+		string first_alias;
+		for (auto &t : src_tables) {
+			auto staging_check = shadow_con.TableInfo("sidra_staging_view_" + t);
+			if (staging_check) {
+				// Find if this table has an alias in the query (e.g., "daily_steps_user a")
+				string lower_q = StringUtil::Lower(cmv_query);
+				string lower_t = StringUtil::Lower(t);
+				auto pos = lower_q.find(lower_t);
+				if (pos != string::npos) {
+					// Check for alias after table name: "table_name <alias>"
+					idx_t after = pos + t.size();
+					if (after < cmv_query.size() && cmv_query[after] == ' ') {
+						idx_t alias_start = after + 1;
+						idx_t alias_end = alias_start;
+						while (alias_end < cmv_query.size() && cmv_query[alias_end] != ' ' &&
+						       cmv_query[alias_end] != ',' && cmv_query[alias_end] != ')') {
+							alias_end++;
+						}
+						string maybe_alias = StringUtil::Lower(cmv_query.substr(alias_start, alias_end - alias_start));
+						// Skip SQL keywords that aren't aliases
+						if (maybe_alias != "join" && maybe_alias != "on" && maybe_alias != "where" &&
+						    maybe_alias != "group" && maybe_alias != "order" && maybe_alias != "having" &&
+						    maybe_alias != "limit" && maybe_alias != "inner" && maybe_alias != "left" &&
+						    maybe_alias != "right" && maybe_alias != "full" && maybe_alias != "cross" &&
+						    !maybe_alias.empty() && first_alias.empty()) {
+							first_alias = cmv_query.substr(alias_start, alias_end - alias_start);
+						}
+					}
+				}
+				cmv_query = StringUtil::Replace(cmv_query, t, "sidra_staging_view_" + t);
+			}
+		}
+
+		// Inject sidra_window into SELECT and GROUP BY
+		string window_col = first_alias.empty() ? "sidra_window" : first_alias + ".sidra_window";
+		{
+			string lower = StringUtil::Lower(cmv_query);
+			auto select_pos = lower.find("select ");
+			auto group_pos = lower.find("group by ");
+			if (select_pos != string::npos && group_pos != string::npos) {
+				// Insert GROUP BY first (higher position)
+				cmv_query.insert(group_pos + 9, window_col + ", ");
+				// Then SELECT
+				cmv_query.insert(select_pos + 7, window_col + ", ");
+			}
+		}
+		SERVER_DEBUG_PRINT("[CMV] Modified query:\n" + cmv_query);
+
+		string create_mv = "CREATE MATERIALIZED VIEW " + view_name + " AS " + cmv_query;
 		auto mv_r = shadow_con.Query(create_mv);
 		if (mv_r->HasError()) {
 			throw ParserException("Error compiling centralized MV: " + mv_r->GetError());
@@ -516,17 +581,8 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		// Use first source for backward compat in single-source case
 		string staging_table = "sidra_staging_view_" + source_views[0];
 
-		// Step 3: Plan the CMV query, replace GET nodes, call LPTS
-		string clean_query = view_query;
-		StringUtil::Trim(clean_query);
-		if (!clean_query.empty() && clean_query.back() == ';') {
-			clean_query.pop_back();
-			StringUtil::Trim(clean_query);
-		}
-		if (!clean_query.empty() && clean_query.front() == '(' && clean_query.back() == ')') {
-			clean_query = clean_query.substr(1, clean_query.size() - 2);
-			StringUtil::Trim(clean_query);
-		}
+		// Step 3: Plan the CMV query (already has sidra_window + staging redirects), call LPTS
+		string clean_query = cmv_query;
 
 		// Plan in shadow DB where source table exists
 		duckdb::Parser query_parser;
@@ -638,8 +694,8 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		cmv_ddl = cmv_ddl.substr(0, cmv_ddl.size() - 2) + ")";
 		metadata_queries.push_back(cmv_ddl);
 
-		// Add observability columns via ALTER TABLE (Table 1 + Table 2 in paper)
-		metadata_queries.push_back("ALTER TABLE " + cmv_data_table + " ADD COLUMN sidra_window INT DEFAULT 0");
+		// Add observability metric columns via ALTER TABLE (Table 1 in paper)
+		// sidra_window is already in the IVM data table (injected into query before OpenIVM)
 		metadata_queries.push_back("ALTER TABLE " + cmv_data_table +
 		                           " ADD COLUMN responsiveness NUMERIC(5,2) DEFAULT 0");
 		metadata_queries.push_back("ALTER TABLE " + cmv_data_table +
