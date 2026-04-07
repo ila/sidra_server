@@ -83,7 +83,8 @@ void EnsureMetadataTables(Connection &con) {
 	    "CREATE TABLE IF NOT EXISTS sidra_current_window(view_name VARCHAR, sidra_window INT, last_update TIMESTAMP, "
 	    "PRIMARY KEY(view_name))",
 	    "CREATE TABLE IF NOT EXISTS sidra_cmv_queries(view_name VARCHAR PRIMARY KEY, source_view VARCHAR, "
-	    "compiled_merge_sql VARCHAR, data_table_name VARCHAR, ivm_type VARCHAR, last_flush TIMESTAMP DEFAULT now())",
+	    "delta_sql VARCHAR, merge_template VARCHAR, data_table_name VARCHAR, ivm_type VARCHAR, last_flush TIMESTAMP "
+	    "DEFAULT now())",
 	};
 
 	for (auto &ddl : SYSTEM_TABLE_DDL) {

@@ -78,6 +78,26 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	string server_db_name = context.db->config.options.database_path;
 
 	auto view_name = StringValue::Get(parameters.values[0]);
+
+	// Check if this is a CMV (centralized materialized view) — flush via delta_sql + merge_template
+	auto cmv_check = server_con.Query("SELECT delta_sql, merge_template, data_table_name FROM sidra_cmv_queries "
+	                                  "WHERE view_name = '" +
+	                                  EscapeSingleQuotes(view_name) + "'");
+	if (!cmv_check->HasError() && cmv_check->RowCount() > 0) {
+		string cmv_delta_sql = cmv_check->GetValue(0, 0).ToString();
+		string cmv_merge_template = cmv_check->GetValue(1, 0).ToString();
+		string cmv_flush_sql = "WITH ivm_cte AS (\n" + cmv_delta_sql + "\n)\n" + cmv_merge_template + ";";
+		SERVER_DEBUG_PRINT("[CMV FLUSH] " + view_name + ":\n" + cmv_flush_sql);
+		server_con.BeginTransaction();
+		auto cmv_r = server_con.Query(cmv_flush_sql);
+		if (cmv_r->HasError()) {
+			server_con.Rollback();
+			throw ParserException("CMV flush failed for '" + view_name + "': " + cmv_r->GetError());
+		}
+		server_con.Commit();
+		return;
+	}
+
 	auto staging_view = "sidra_staging_view_" + view_name;
 	auto centralized_table = "sidra_centralized_view_" + view_name;
 
@@ -268,12 +288,10 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	ExecuteCommitLogAndWriteQueries(server_con, queries, file_name, view_name, append, flush_run, true);
 	flush_run++;
 
-	// Phase 3: Update dependent CMVs via IVM
-	// The compiled_merge_sql was generated at CREATE time via plan traversal + LPTS.
-	// It already references the staging table. We just execute it.
-	// Find CMVs that depend on this view (source_view is comma-separated list)
+	// Phase 3: Update dependent CMVs
+	// delta_sql reads from centralized tables (no timestamps), merge_template does the upsert
 	auto cmv_result =
-	    server_con.Query("SELECT view_name, compiled_merge_sql, data_table_name "
+	    server_con.Query("SELECT view_name, delta_sql, merge_template, data_table_name "
 	                     "FROM sidra_cmv_queries WHERE source_view = '" +
 	                     EscapeSingleQuotes(view_name) + "' OR source_view LIKE '" + EscapeSingleQuotes(view_name) +
 	                     ",%' OR source_view LIKE '%," + EscapeSingleQuotes(view_name) + "' OR source_view LIKE '%," +
@@ -284,14 +302,18 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 
 	for (idx_t i = 0; i < cmv_result->RowCount(); i++) {
 		string cmv_name = cmv_result->GetValue(0, i).ToString();
-		string compiled_sql = cmv_result->GetValue(1, i).ToString();
-		string cmv_data_table = cmv_result->GetValue(2, i).ToString();
+		string cmv_delta_sql = cmv_result->GetValue(1, i).ToString();
+		string cmv_merge_template = cmv_result->GetValue(2, i).ToString();
+		string cmv_data_table = cmv_result->GetValue(3, i).ToString();
 
-		SERVER_DEBUG_PRINT("[CMV FLUSH] Executing pre-compiled IVM for: " + cmv_name);
-		SERVER_DEBUG_PRINT("[CMV FLUSH] SQL:\n" + compiled_sql);
+		// Assemble fresh SQL at flush time (no stale timestamps)
+		string cmv_flush_sql = "WITH ivm_cte AS (\n" + cmv_delta_sql + "\n)\n" + cmv_merge_template + ";";
+
+		SERVER_DEBUG_PRINT("[CMV FLUSH] Executing for: " + cmv_name);
+		SERVER_DEBUG_PRINT("[CMV FLUSH] SQL:\n" + cmv_flush_sql);
 
 		server_con.BeginTransaction();
-		auto cmv_r = server_con.Query(compiled_sql);
+		auto cmv_r = server_con.Query(cmv_flush_sql);
 		if (cmv_r->HasError()) {
 			server_con.Rollback();
 			SERVER_DEBUG_PRINT("[CMV FLUSH] ERROR: " + cmv_r->GetError());

@@ -8,6 +8,7 @@
 #include "logical_plan_to_sql.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -499,9 +500,18 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		planner.CreatePlan(std::move(query_parser.statements[0]));
 		auto plan = std::move(planner.plan);
 
-		// Walk plan: replace GET(source_view) → GET(staging_table) for ALL source views
+		// Walk plan: replace GET(source_view) → GET(centralized_table) for ALL source views
+		// CMVs read from centralized tables (which contain the flushed data after DMV flush)
 		for (auto &sv : source_views) {
-			RedirectGetNodes(plan, sv, "sidra_staging_view_" + sv, *shadow_con.context);
+			// Ensure centralized table exists in shadow DB for plan resolution
+			auto cv_info = shadow_con.TableInfo("sidra_centralized_view_" + sv);
+			if (!cv_info) {
+				string cv_ddl = ConstructTable(shadow_con, sv, false);
+				cv_ddl = std::regex_replace(cv_ddl, std::regex(R"(create table )", std::regex_constants::icase),
+				                            "CREATE TABLE IF NOT EXISTS ");
+				shadow_con.Query(cv_ddl);
+			}
+			RedirectGetNodes(plan, sv, "sidra_centralized_view_" + sv, *shadow_con.context);
 		}
 
 		// Inject HAVING COUNT(DISTINCT client_id) >= min_agg at the plan level
@@ -514,9 +524,8 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 			}
 		}
 
-		// Convert modified plan to SQL via LPTS (called from C++)
-		// Pass planner.names so LPTS preserves original column aliases (city, total_steps)
-		LogicalPlanToSql lpts(*shadow_con.context, plan);
+		// Convert modified plan to SQL via LPTS, passing planner.names for correct output aliases
+		LogicalPlanToSql lpts(*shadow_con.context, plan, planner.names);
 		auto cte_list = lpts.LogicalPlanToCteList();
 		string delta_sql = LogicalPlanToSql::CteListToSql(cte_list);
 		StringUtil::Trim(delta_sql);
@@ -532,10 +541,16 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		shadow_con.Rollback();
 		SERVER_DEBUG_PRINT("[CMV] LPTS delta SQL:\n" + delta_sql);
 
-		// Step 4: Get MERGE template from OpenIVM
+		// Step 4: Get upsert template from OpenIVM
+		// The MV was already compiled in Step 1. Now run PRAGMA ivm to get the upsert SQL.
 		string ivm_files_dir = "/tmp/sidra_ivm_compile";
+		LocalFileSystem local_fs;
+		local_fs.CreateDirectory(ivm_files_dir);
 		shadow_con.Query("SET ivm_files_path = '" + ivm_files_dir + "'");
-		shadow_con.Query("PRAGMA ivm('" + EscapeSingleQuotes(view_name) + "')");
+		auto ivm_pragma_result = shadow_con.Query("PRAGMA ivm('" + EscapeSingleQuotes(view_name) + "')");
+		if (ivm_pragma_result->HasError()) {
+			throw ParserException("PRAGMA ivm failed for CMV '" + view_name + "': " + ivm_pragma_result->GetError());
+		}
 
 		string ivm_file = ivm_files_dir + "/ivm_upsert_queries_" + view_name + ".sql";
 		string compiled_ivm;
@@ -547,29 +562,36 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 				compiled_ivm = buf.str();
 			}
 		}
+		SERVER_DEBUG_PRINT("[CMV] OpenIVM compiled:\n" + compiled_ivm);
 
-		string merge_portion;
-		auto merge_pos = compiled_ivm.find("MERGE INTO");
-		if (merge_pos == string::npos) {
-			merge_pos = compiled_ivm.find("merge into");
-		}
-		if (merge_pos != string::npos) {
-			auto merge_end = compiled_ivm.find(';', merge_pos);
-			if (merge_end != string::npos) {
-				merge_portion = compiled_ivm.substr(merge_pos, merge_end - merge_pos);
+		// Extract the upsert portion (INSERT OR REPLACE INTO or MERGE INTO)
+		string upsert_portion;
+		for (auto &marker : {"insert or replace into", "INSERT OR REPLACE INTO", "MERGE INTO", "merge into"}) {
+			auto pos = compiled_ivm.find(marker);
+			if (pos != string::npos) {
+				auto end = compiled_ivm.find(';', pos);
+				if (end != string::npos) {
+					upsert_portion = compiled_ivm.substr(pos, end - pos);
+					break;
+				}
 			}
 		}
-		if (merge_portion.empty()) {
-			throw ParserException("Could not extract MERGE from OpenIVM compiled SQL");
+		if (upsert_portion.empty()) {
+			throw ParserException("Could not extract upsert from OpenIVM compiled SQL for CMV '" + view_name + "'");
 		}
 
-		// Redirect MERGE table: _ivm_data_<name> → sidra_cmv_data_<name>
+		// Redirect table references to CMV data table
 		string cmv_data_table = "sidra_cmv_data_" + view_name;
-		merge_portion = StringUtil::Replace(merge_portion, ivm_data_table, cmv_data_table);
+		// Replace _ivm_data_<name> with CMV data table
+		upsert_portion = StringUtil::Replace(upsert_portion, ivm_data_table, cmv_data_table);
+		// Replace bare view name references (e.g., "left join combined on")
+		// but not inside cmv_data_table which already contains the view name
+		upsert_portion = StringUtil::Replace(upsert_portion, "left join " + view_name + " on",
+		                                     "left join " + cmv_data_table + " on");
 
-		// Step 5: Assemble complete flush SQL (HAVING is already in the plan via LPTS)
-		string flush_sql = "WITH ivm_cte AS (\n\t" + delta_sql + "\n)\n" + merge_portion + ";\n";
-		SERVER_DEBUG_PRINT("[CMV] Assembled flush SQL:\n" + flush_sql);
+		// Step 5: Store delta SQL and merge template separately (assembled at flush time)
+		SERVER_DEBUG_PRINT("[CMV] Delta SQL:\n" + delta_sql);
+		SERVER_DEBUG_PRINT("[CMV] Merge template:\n" + upsert_portion);
 
 		// Step 6: Create CMV data table on main DB
 		string cmv_ddl = "CREATE TABLE IF NOT EXISTS " + cmv_data_table + " (";
@@ -590,8 +612,9 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		                           ", now())");
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_cmv_queries VALUES('" + EscapeSingleQuotes(view_name) +
 		                           "', '" + EscapeSingleQuotes(source_views_str) + "', '" +
-		                           EscapeSingleQuotes(flush_sql) + "', '" + EscapeSingleQuotes(cmv_data_table) +
-		                           "', '" + EscapeSingleQuotes(ivm_type) + "', now())");
+		                           EscapeSingleQuotes(delta_sql) + "', '" + EscapeSingleQuotes(upsert_portion) +
+		                           "', '" + EscapeSingleQuotes(cmv_data_table) + "', '" + EscapeSingleQuotes(ivm_type) +
+		                           "', now())");
 
 		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type + " source=" + source_view +
 		                   " data_table=" + cmv_data_table + ")");

@@ -495,3 +495,64 @@ query I
 SELECT COUNT(*) FROM sidra_staging_view_daily_steps WHERE sidra_window = 7;
 ----
 0
+
+# ============================================================
+# Test 16: CMV joining two DMVs
+# ============================================================
+
+# Create a second base table + DMV
+statement ok
+CREATE DECENTRALIZED TABLE calories_log (city VARCHAR DIMENSION, cals INT FACT);
+
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW daily_cals AS SELECT city, SUM(cals) AS total_cals FROM calories_log GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+
+# Create CMV joining both DMVs
+statement ok
+CREATE CENTRALIZED MATERIALIZED VIEW combined AS SELECT a.city, SUM(a.total_steps) AS total_steps, SUM(b.total_cals) AS total_cals FROM daily_steps a JOIN daily_cals b ON a.city = b.city GROUP BY a.city REFRESH 12;
+
+# Verify CMV metadata stores both source views
+query I
+SELECT source_view FROM sidra_cmv_queries WHERE view_name = 'combined';
+----
+daily_cals,daily_steps
+
+# Insert data into both staging views
+statement ok
+DELETE FROM sidra_staging_view_daily_steps;
+
+statement ok
+UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps';
+
+statement ok
+UPDATE sidra_current_window SET sidra_window = 0 WHERE view_name = 'sidra_staging_view_daily_steps';
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps VALUES ('Berlin', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps VALUES ('Paris', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_cals VALUES ('Berlin', 500, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_cals VALUES ('Paris', 700, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
+
+# Flush both DMVs first, then flush the CMV
+statement ok
+pragma flush('daily_steps', 'duckdb');
+
+statement ok
+pragma flush('daily_cals', 'duckdb');
+
+# Explicitly flush the CMV (reads from centralized tables populated by DMV flushes)
+statement ok
+pragma flush('combined', 'duckdb');
+
+# Verify CMV data table has joined results
+query III
+SELECT city, total_steps, total_cals FROM sidra_cmv_data_combined ORDER BY city;
+----
+Berlin	100	500
+Paris	200	700
