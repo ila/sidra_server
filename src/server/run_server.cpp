@@ -276,8 +276,12 @@ static void UpdateTimestampClient(int32_t connfd, Connection &con) {
 	string timestamp_string(timestamp.begin(), timestamp.end());
 
 	con.BeginTransaction();
-	con.Query("update sidra_clients set last_update = '" + EscapeSingleQuotes(timestamp_string) +
-	          "' where id = " + std::to_string(id) + ";");
+	auto update_r = con.Query("update sidra_clients set last_update = '" + EscapeSingleQuotes(timestamp_string) +
+	                          "' where id = " + std::to_string(id) + ";");
+	if (update_r->HasError()) {
+		con.Rollback();
+		throw IOException("Failed to update client timestamp: " + update_r->GetError());
+	}
 	con.Commit();
 }
 

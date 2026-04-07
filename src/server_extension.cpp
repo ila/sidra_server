@@ -74,8 +74,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 		Connection con(db);
 		EnsureMetadataTables(con);
 		SERVER_DEBUG_PRINT("SIDRA metadata tables initialized in main DB");
-	} catch (...) {
-		SERVER_DEBUG_PRINT("Could not initialize metadata tables (non-fatal at load time)");
+	} catch (const std::exception &e) {
+		Printer::Print("Warning: SIDRA metadata tables could not be initialized: " + string(e.what()));
 	}
 
 	// Register extension option for config path

@@ -102,7 +102,15 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 				auto cw = server_con.Query("SELECT sidra_window FROM sidra_current_window WHERE view_name = "
 				                           "'sidra_staging_view_" +
 				                           EscapeSingleQuotes(sv) + "'");
-				if (!vc->HasError() && vc->RowCount() > 0 && !cw->HasError() && cw->RowCount() > 0) {
+				if (vc->HasError()) {
+					Printer::Print("Warning: could not look up view constraints for '" + sv + "': " + vc->GetError());
+				} else if (cw->HasError()) {
+					Printer::Print("Warning: could not look up current window for '" + sv + "': " + cw->GetError());
+				} else if (vc->RowCount() == 0) {
+					Printer::Print("Warning: no view constraints found for '" + sv + "' — TTL filter not applied");
+				} else if (cw->RowCount() == 0) {
+					Printer::Print("Warning: no current window found for '" + sv + "' — TTL filter not applied");
+				} else {
 					auto window_size = vc->GetValue(0, 0).GetValue<int32_t>();
 					auto ttl = vc->GetValue(1, 0).GetValue<int32_t>();
 					auto current_window = cw->GetValue(0, 0).GetValue<int32_t>();
@@ -113,6 +121,8 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 						cmv_delta_sql = StringUtil::Replace(cmv_delta_sql, staging_table + ")", ttl_filter + ")");
 						SERVER_DEBUG_PRINT("[CMV FLUSH] Injected TTL filter (window > " + to_string(expired_window) +
 						                   ") for " + staging_table);
+					} else {
+						Printer::Print("Warning: window_size is 0 for '" + sv + "' — TTL filter not applied");
 					}
 				}
 			}

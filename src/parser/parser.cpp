@@ -423,10 +423,13 @@ static vector<string> CompileTableCreation(Connection &shadow_con, SIDRAParseDat
 	if (data.scope == TableScope::decentralized) {
 		// Store constraints in shadow DB for future view validation
 		for (auto &[col_name, constraint] : data.table_constraints) {
-			shadow_con.Query("INSERT OR REPLACE INTO sidra_table_constraints VALUES ('" +
-			                 EscapeSingleQuotes(table_name) + "', '" + EscapeSingleQuotes(col_name) + "', " +
-			                 to_string(constraint.sensitive) + ", " + to_string(constraint.fact) + ", " +
-			                 to_string(constraint.dimension) + ")");
+			auto cr = shadow_con.Query("INSERT OR REPLACE INTO sidra_table_constraints VALUES ('" +
+			                           EscapeSingleQuotes(table_name) + "', '" + EscapeSingleQuotes(col_name) + "', " +
+			                           to_string(constraint.sensitive) + ", " + to_string(constraint.fact) + ", " +
+			                           to_string(constraint.dimension) + ")");
+			if (cr->HasError()) {
+				throw ParserException("Failed to store constraint for column '" + col_name + "': " + cr->GetError());
+			}
 		}
 
 		// Constraint metadata for main DB
@@ -635,7 +638,10 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		string ivm_files_dir = "/tmp/sidra_ivm_compile";
 		LocalFileSystem local_fs;
 		local_fs.CreateDirectory(ivm_files_dir);
-		shadow_con.Query("SET ivm_files_path = '" + ivm_files_dir + "'");
+		auto set_r = shadow_con.Query("SET ivm_files_path = '" + ivm_files_dir + "'");
+		if (set_r->HasError()) {
+			throw ParserException("Failed to set ivm_files_path: " + set_r->GetError());
+		}
 		auto ivm_pragma_result = shadow_con.Query("PRAGMA ivm('" + EscapeSingleQuotes(view_name) + "')");
 		if (ivm_pragma_result->HasError()) {
 			throw ParserException("PRAGMA ivm failed for CMV '" + view_name + "': " + ivm_pragma_result->GetError());
