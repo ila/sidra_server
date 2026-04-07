@@ -168,9 +168,13 @@ SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'sidra_staging
 ----
 1
 
-# Centralized view table exists with observability columns
+# Define a CMV on top — this creates the centralized view table
+statement ok
+CREATE CENTRALIZED MATERIALIZED VIEW city_totals AS SELECT city, SUM(total) AS total FROM daily_steps GROUP BY city REFRESH 12;
+
+# Centralized view table now exists (created by CMV compilation)
 query I
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'sidra_centralized_view_daily_steps';
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'sidra_centralized_view_city_totals';
 ----
 1
 

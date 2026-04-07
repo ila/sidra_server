@@ -576,7 +576,7 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		}
 
 		// Redirect table references to CMV data table
-		string cmv_data_table = "sidra_cmv_data_" + view_name;
+		string cmv_data_table = "sidra_centralized_view_" + view_name;
 		// Replace _ivm_data_<name> with CMV data table
 		upsert_portion = StringUtil::Replace(upsert_portion, ivm_data_table, cmv_data_table);
 		// Replace bare view name references (e.g., "left join combined on")
@@ -588,7 +588,7 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		SERVER_DEBUG_PRINT("[CMV] Delta SQL:\n" + delta_sql);
 		SERVER_DEBUG_PRINT("[CMV] Merge template:\n" + upsert_portion);
 
-		// Step 6: Create CMV data table on main DB
+		// Step 6: Create centralized view table on main DB
 		string cmv_ddl = "CREATE TABLE IF NOT EXISTS " + cmv_data_table + " (";
 		for (auto &col : data_info->columns) {
 			auto col_name = col.GetName();
@@ -651,12 +651,8 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		// Also create staging table in shadow DB (needed for CMV plan traversal later)
 		shadow_con.Query(staging_ddl);
 
-		// Create the centralized view table (final aggregated result with metrics)
-		string centralized_ddl = ConstructTable(shadow_con, view_name, false);
-		centralized_ddl =
-		    std::regex_replace(centralized_ddl, std::regex(R"(create table )", std::regex_constants::icase),
-		                       "CREATE TABLE IF NOT EXISTS ");
-		metadata_queries.push_back(centralized_ddl);
+		// The centralized view table is created by the CMV compilation path.
+		// Users must define a CMV to flush data from staging to centralized.
 
 		// Metadata inserts
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_view_constraints VALUES('" +
@@ -666,9 +662,6 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_tables VALUES('sidra_staging_view_" +
 		                           EscapeSingleQuotes(view_name) + "', " +
 		                           to_string(static_cast<int32_t>(TableScope::centralized)) + ", NULL, true)");
-		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_tables VALUES('sidra_centralized_view_" +
-		                           EscapeSingleQuotes(view_name) + "', " +
-		                           to_string(static_cast<int32_t>(TableScope::centralized)) + ", NULL, false)");
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_current_window VALUES('sidra_staging_view_" +
 		                           EscapeSingleQuotes(view_name) + "', 0, now())");
 

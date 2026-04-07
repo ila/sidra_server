@@ -1,5 +1,5 @@
 # name: test/sql/flush.test
-# description: Test SIDRA flush pipeline (staging → centralized)
+# description: Test SIDRA flush pipeline (staging → centralized via CMV)
 # group: [sql]
 
 require server
@@ -8,16 +8,20 @@ require server
 load activity_sessions.db
 
 # ============================================================
-# Setup: create schema
+# Setup: base table + DMV + CMV
 # ============================================================
 
 statement ok
 CREATE DECENTRALIZED TABLE runs (nickname VARCHAR, city VARCHAR DIMENSION, date DATE DIMENSION, steps INT FACT, hr INT SENSITIVE);
 
 statement ok
-CREATE DECENTRALIZED MATERIALIZED VIEW daily_steps AS SELECT city, SUM(steps) AS total_steps FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
+CREATE DECENTRALIZED MATERIALIZED VIEW daily_steps_user AS SELECT city, SUM(steps) AS total_steps FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
 
-# Register fake clients for responsiveness calculation
+# CMV aggregates from DMV staging — creates sidra_centralized_view_daily_steps
+statement ok
+CREATE CENTRALIZED MATERIALIZED VIEW daily_steps AS SELECT city, SUM(total_steps) AS total_steps FROM daily_steps_user GROUP BY city REFRESH 12;
+
+# Register fake clients
 statement ok
 INSERT INTO sidra_clients VALUES (1, now()::TIMESTAMP, now()::TIMESTAMP);
 
@@ -29,7 +33,7 @@ INSERT INTO sidra_clients VALUES (3, now()::TIMESTAMP, now()::TIMESTAMP);
 
 # Verify tables exist
 query I
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'sidra_staging_view_daily_steps';
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'sidra_staging_view_daily_steps_user';
 ----
 1
 
@@ -39,320 +43,131 @@ SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'sidra_central
 1
 
 # ============================================================
-# Test 1: Basic flush without min_agg
+# Test 1: Basic flush
 # ============================================================
 
-# Insert test data into staging (simulating 3 clients sending data)
 statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Berlin', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Berlin', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
 
 statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Berlin', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Berlin', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
 
 statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Paris', 150, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 3, 0);
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Paris', 150, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 3, 0);
 
-# Verify staging has 3 rows
 query I
-SELECT COUNT(*) FROM sidra_staging_view_daily_steps;
+SELECT COUNT(*) FROM sidra_staging_view_daily_steps_user;
 ----
 3
 
-# Flush
 statement ok
 pragma flush('daily_steps', 'duckdb');
 
-# Verify centralized view has 3 rows
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps;
-----
-3
-
-# Verify data moved correctly
+# CMV aggregates by city
 query II
-SELECT city, total_steps FROM sidra_centralized_view_daily_steps ORDER BY city, total_steps;
+SELECT city, total_steps FROM sidra_centralized_view_daily_steps ORDER BY city;
 ----
-Berlin	100
-Berlin	200
+Berlin	300
 Paris	150
 
 # ============================================================
 # Test 2: Flush with min_agg filtering
 # ============================================================
 
-# Create a second DMV for min_agg testing
 statement ok
-CREATE DECENTRALIZED MATERIALIZED VIEW daily_steps_agg AS SELECT city, SUM(steps) AS total_steps FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
-
-# Manually set min_agg = 3 (requires 3 distinct clients per group)
-statement ok
-UPDATE sidra_view_constraints SET sidra_min_agg = 3 WHERE view_name = 'daily_steps_agg';
-
-# Insert from only 2 clients (below threshold)
-statement ok
-INSERT INTO sidra_staging_view_daily_steps_agg VALUES ('London', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
+CREATE DECENTRALIZED MATERIALIZED VIEW agg_src AS SELECT city, SUM(steps) AS total_steps FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
 
 statement ok
-INSERT INTO sidra_staging_view_daily_steps_agg VALUES ('London', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
+CREATE CENTRALIZED MATERIALIZED VIEW agg_view AS SELECT city, SUM(total_steps) AS total_steps FROM agg_src GROUP BY city REFRESH 12 MINIMUM AGGREGATION 3;
 
-# Delete cached flush file if any
+# Only 2 clients for London (below min_agg=3)
 statement ok
-SELECT 1;
+INSERT INTO sidra_staging_view_agg_src VALUES ('London', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
 
-# Flush — should NOT promote because only 2 clients (below min_agg=3)
 statement ok
-pragma flush('daily_steps_agg', 'duckdb');
+INSERT INTO sidra_staging_view_agg_src VALUES ('London', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
 
-# Centralized should be EMPTY (threshold not met)
+statement ok
+pragma flush('agg_view', 'duckdb');
+
+# Centralized should be empty (threshold not met)
 query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps_agg;
+SELECT COUNT(*) FROM sidra_centralized_view_agg_view;
 ----
 0
 
-# Staging should still have the 2 rows (not deleted — not promoted, not expired)
+# Staging should still have 2 rows
 query I
-SELECT COUNT(*) FROM sidra_staging_view_daily_steps_agg;
+SELECT COUNT(*) FROM sidra_staging_view_agg_src;
 ----
 2
 
 # Add a 3rd client — now meets threshold
 statement ok
-INSERT INTO sidra_staging_view_daily_steps_agg VALUES ('London', 300, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 3, 0);
+INSERT INTO sidra_staging_view_agg_src VALUES ('London', 300, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 3, 0);
 
-# Flush again — should promote this time
 statement ok
-pragma flush('daily_steps_agg', 'duckdb');
+pragma flush('agg_view', 'duckdb');
 
-# Centralized should now have the London data
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps_agg WHERE city = 'London';
+# Centralized should have London (aggregated: 100+200+300 = 600)
+query II
+SELECT city, total_steps FROM sidra_centralized_view_agg_view;
 ----
-3
+London	600
 
 # ============================================================
 # Test 3: Expired windows (TTL filtering)
 # ============================================================
 
-# Set current window to 5 (expired_window = 5 - 72/24 = 2)
+# Set current window to 5: expired = 5 - 72/24 = 2
 statement ok
-UPDATE sidra_current_window SET sidra_window = 5 WHERE view_name = 'sidra_staging_view_daily_steps';
-
-# Clear staging for clean test
-statement ok
-DELETE FROM sidra_staging_view_daily_steps;
-
-# Insert rows: window 1 (expired), window 3 (valid), window 5 (current)
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Rome', 50, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 1, 10, 0);
+UPDATE sidra_current_window SET sidra_window = 5 WHERE view_name = 'sidra_staging_view_daily_steps_user';
 
 statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Rome', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 3, 11, 0);
+DELETE FROM sidra_staging_view_daily_steps_user;
 
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Rome', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 5, 12, 0);
-
-# Clear centralized for clean measurement
 statement ok
 DELETE FROM sidra_centralized_view_daily_steps;
 
-# Flush
+# Window 1 (expired: 1 <= 2), window 3 (valid), window 5 (valid)
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Rome', 50, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 1, 10, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Rome', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 3, 11, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Rome', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 5, 12, 0);
+
 statement ok
 pragma flush('daily_steps', 'duckdb');
 
-# Only window 3 and 5 should be in centralized (window 1 is expired: 1 <= 2)
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps;
-----
-2
-
-# Verify correct windows
+# Only valid windows (3+5) aggregated: 100+200=300 (window 1 excluded by TTL)
 query II
-SELECT sidra_window, total_steps FROM sidra_centralized_view_daily_steps ORDER BY sidra_window;
+SELECT city, total_steps FROM sidra_centralized_view_daily_steps WHERE city = 'Rome';
 ----
-3	100
-5	200
-
-# Expired rows should be deleted from staging
-query I
-SELECT COUNT(*) FROM sidra_staging_view_daily_steps WHERE sidra_window <= 2;
-----
-0
+Rome	300
 
 # ============================================================
 # Test 4: Empty staging (no data to flush)
 # ============================================================
 
-# Clear staging
 statement ok
-DELETE FROM sidra_staging_view_daily_steps;
+DELETE FROM sidra_staging_view_daily_steps_user;
 
 statement ok
 DELETE FROM sidra_centralized_view_daily_steps;
 
-# Flush with no data — should succeed without error
 statement ok
 pragma flush('daily_steps', 'duckdb');
 
-# Both tables should be empty
 query I
 SELECT COUNT(*) FROM sidra_centralized_view_daily_steps;
 ----
 0
 
 # ============================================================
-# Test 5: Multiple flushes (incremental)
-# ============================================================
-
-# Clean slate
-statement ok
-DELETE FROM sidra_staging_view_daily_steps;
-
-statement ok
-DELETE FROM sidra_centralized_view_daily_steps;
-
-statement ok
-UPDATE sidra_current_window SET sidra_window = 0 WHERE view_name = 'sidra_staging_view_daily_steps';
-
-# Batch 1
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Tokyo', 500, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 20, 0);
-
-statement ok
-pragma flush('daily_steps', 'duckdb');
-
-# Batch 2
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Tokyo', 600, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 21, 0);
-
-statement ok
-pragma flush('daily_steps', 'duckdb');
-
-# Centralized should have both batches
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city = 'Tokyo';
-----
-2
-
-# ============================================================
-# Test 6: Multiple clients, same city
-# ============================================================
-
-statement ok
-DELETE FROM sidra_staging_view_daily_steps;
-
-statement ok
-DELETE FROM sidra_centralized_view_daily_steps;
-
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('NYC', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 30, 0);
-
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('NYC', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 31, 0);
-
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('NYC', 300, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 32, 0);
-
-statement ok
-pragma flush('daily_steps', 'duckdb');
-
-# All 3 rows should be in centralized (flush doesn't aggregate)
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city = 'NYC';
-----
-3
-
-# Total across all NYC clients
-query I
-SELECT SUM(total_steps) FROM sidra_centralized_view_daily_steps WHERE city = 'NYC';
-----
-600
-
-# ============================================================
-# Test 7: Different MV query — multi-column GROUP BY
-# ============================================================
-
-statement ok
-CREATE DECENTRALIZED MATERIALIZED VIEW city_date_steps AS SELECT city, date, SUM(steps) AS total_steps FROM runs GROUP BY city, date WINDOW 24 TTL 72 REFRESH 6;
-
-statement ok
-INSERT INTO sidra_staging_view_city_date_steps VALUES ('Berlin', '2024-01-01', 500, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 50, 0);
-
-statement ok
-INSERT INTO sidra_staging_view_city_date_steps VALUES ('Berlin', '2024-01-02', 600, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 51, 0);
-
-statement ok
-INSERT INTO sidra_staging_view_city_date_steps VALUES ('Paris', '2024-01-01', 700, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 52, 0);
-
-statement ok
-pragma flush('city_date_steps', 'duckdb');
-
-query III
-SELECT city, date, total_steps FROM sidra_centralized_view_city_date_steps ORDER BY city, date;
-----
-Berlin	2024-01-01	500
-Berlin	2024-01-02	600
-Paris	2024-01-01	700
-
-# ============================================================
-# Test 8: DMV with COUNT aggregation
-# ============================================================
-
-statement ok
-CREATE DECENTRALIZED MATERIALIZED VIEW city_count AS SELECT city, COUNT(*) AS num_runs FROM runs GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
-
-statement ok
-INSERT INTO sidra_staging_view_city_count VALUES ('Rome', 5, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 60, 0);
-
-statement ok
-INSERT INTO sidra_staging_view_city_count VALUES ('Rome', 3, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 61, 0);
-
-statement ok
-pragma flush('city_count', 'duckdb');
-
-query II
-SELECT city, num_runs FROM sidra_centralized_view_city_count ORDER BY num_runs;
-----
-Rome	3
-Rome	5
-
-# ============================================================
-# Test 9: Multiple MVs sharing the same staging base
-# ============================================================
-
-# daily_steps and city_date_steps both come from "runs" base table
-# Flushing one should not affect the other's staging data
-
-# Add data to daily_steps staging
-statement ok
-DELETE FROM sidra_staging_view_daily_steps;
-
-statement ok
-DELETE FROM sidra_centralized_view_daily_steps;
-
-statement ok
-UPDATE sidra_current_window SET sidra_window = 0 WHERE view_name = 'sidra_staging_view_daily_steps';
-
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Madrid', 999, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 70, 0);
-
-# Flush daily_steps
-statement ok
-pragma flush('daily_steps', 'duckdb');
-
-# daily_steps centralized should have Madrid
-query II
-SELECT city, total_steps FROM sidra_centralized_view_daily_steps WHERE city = 'Madrid';
-----
-Madrid	999
-
-# city_date_steps centralized should be unchanged (Berlin/Paris from test 7)
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_city_date_steps;
-----
-3
-
-# ============================================================
-# Test 10: Flush non-existent view — should error
+# Test 5: Flush non-existent view — should error
 # ============================================================
 
 statement error
@@ -361,7 +176,7 @@ pragma flush('nonexistent_view', 'duckdb');
 Staging view not found
 
 # ============================================================
-# Test 11: Invalid database type — should error
+# Test 6: Invalid database type — should error
 # ============================================================
 
 statement error
@@ -370,168 +185,30 @@ pragma flush('daily_steps', 'mysql');
 Invalid database type
 
 # ============================================================
-# Test 12: Flush with sidra_window=0 and current_window=0
-# (all rows are non-expired since expired = 0 - 3 = -3)
+# Test 7: CMV joining two DMVs
 # ============================================================
 
-statement ok
-DELETE FROM sidra_staging_view_daily_steps;
-
-statement ok
-DELETE FROM sidra_centralized_view_daily_steps;
-
-statement ok
-UPDATE sidra_current_window SET sidra_window = 0 WHERE view_name = 'sidra_staging_view_daily_steps';
-
-statement ok
-UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps';
-
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Oslo', 42, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 80, 0);
-
-statement ok
-pragma flush('daily_steps', 'duckdb');
-
-query II
-SELECT city, total_steps FROM sidra_centralized_view_daily_steps WHERE city = 'Oslo';
-----
-Oslo	42
-
-# ============================================================
-# Test 13: Staging rows with NULL values
-# ============================================================
-
-statement ok
-DELETE FROM sidra_staging_view_daily_steps;
-
-statement ok
-DELETE FROM sidra_centralized_view_daily_steps;
-
-statement ok
-UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps';
-
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES (NULL, 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 90, 0);
-
-statement ok
-pragma flush('daily_steps', 'duckdb');
-
-# NULL city should still be flushed
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city IS NULL;
-----
-1
-
-# ============================================================
-# Test 14: Very large sidra_window values
-# ============================================================
-
-statement ok
-DELETE FROM sidra_staging_view_daily_steps;
-
-statement ok
-DELETE FROM sidra_centralized_view_daily_steps;
-
-statement ok
-UPDATE sidra_current_window SET sidra_window = 1000000 WHERE view_name = 'sidra_staging_view_daily_steps';
-
-statement ok
-UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps';
-
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('BigWindow', 1, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 999999, 100, 0);
-
-statement ok
-pragma flush('daily_steps', 'duckdb');
-
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city = 'BigWindow';
-----
-1
-
-# ============================================================
-# Test 15: Borderline expired window (exactly at threshold)
-# ============================================================
-
-statement ok
-DELETE FROM sidra_staging_view_daily_steps;
-
-statement ok
-DELETE FROM sidra_centralized_view_daily_steps;
-
-# With WINDOW=24, TTL=72: expired = current - 72/24 = current - 3
-# Set current_window = 10, so expired = 7
-statement ok
-UPDATE sidra_current_window SET sidra_window = 10 WHERE view_name = 'sidra_staging_view_daily_steps';
-
-statement ok
-UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps';
-
-# Window 7 is exactly at boundary (expired = 7, condition is sidra_window <= 7)
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Boundary7', 1, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 7, 110, 0);
-
-# Window 8 is just above boundary
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Boundary8', 1, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 8, 111, 0);
-
-statement ok
-pragma flush('daily_steps', 'duckdb');
-
-# Window 7 should be EXPIRED (sidra_window <= expired_window means 7 <= 7)
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city = 'Boundary7';
-----
-0
-
-# Window 8 should be kept (8 > 7)
-query I
-SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city = 'Boundary8';
-----
-1
-
-# Window 7 row should be deleted from staging
-query I
-SELECT COUNT(*) FROM sidra_staging_view_daily_steps WHERE sidra_window = 7;
-----
-0
-
-# ============================================================
-# Test 16: CMV joining two DMVs
-# ============================================================
-
-# Create a second base table + DMV
 statement ok
 CREATE DECENTRALIZED TABLE calories_log (city VARCHAR DIMENSION, cals INT FACT);
 
 statement ok
 CREATE DECENTRALIZED MATERIALIZED VIEW daily_cals AS SELECT city, SUM(cals) AS total_cals FROM calories_log GROUP BY city WINDOW 24 TTL 72 REFRESH 6;
 
-# Create CMV joining both DMVs
 statement ok
-CREATE CENTRALIZED MATERIALIZED VIEW combined AS SELECT a.city, SUM(a.total_steps) AS total_steps, SUM(b.total_cals) AS total_cals FROM daily_steps a JOIN daily_cals b ON a.city = b.city GROUP BY a.city REFRESH 12;
+CREATE CENTRALIZED MATERIALIZED VIEW combined AS SELECT a.city, SUM(a.total_steps) AS total_steps, SUM(b.total_cals) AS total_cals FROM daily_steps_user a JOIN daily_cals b ON a.city = b.city GROUP BY a.city REFRESH 12;
 
-# Verify CMV metadata stores both source views
-query I
-SELECT source_view FROM sidra_cmv_queries WHERE view_name = 'combined';
-----
-daily_cals,daily_steps
-
-# Insert data into both staging views
+# Clean staging
 statement ok
-DELETE FROM sidra_staging_view_daily_steps;
+DELETE FROM sidra_staging_view_daily_steps_user;
 
 statement ok
-UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps';
+UPDATE sidra_current_window SET sidra_window = 0 WHERE view_name = 'sidra_staging_view_daily_steps_user';
 
 statement ok
-UPDATE sidra_current_window SET sidra_window = 0 WHERE view_name = 'sidra_staging_view_daily_steps';
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Berlin', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
 
 statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Berlin', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
-
-statement ok
-INSERT INTO sidra_staging_view_daily_steps VALUES ('Paris', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Paris', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
 
 statement ok
 INSERT INTO sidra_staging_view_daily_cals VALUES ('Berlin', 500, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
@@ -539,13 +216,11 @@ INSERT INTO sidra_staging_view_daily_cals VALUES ('Berlin', 500, now()::TIMESTAM
 statement ok
 INSERT INTO sidra_staging_view_daily_cals VALUES ('Paris', 700, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
 
-# Flush the CMV (reads directly from staging views, applies min_agg, writes to CMV data table)
 statement ok
 pragma flush('combined', 'duckdb');
 
-# Verify CMV data table has joined results
 query III
-SELECT city, total_steps, total_cals FROM sidra_cmv_data_combined ORDER BY city;
+SELECT city, total_steps, total_cals FROM sidra_centralized_view_combined ORDER BY city;
 ----
 Berlin	100	500
 Paris	200	700

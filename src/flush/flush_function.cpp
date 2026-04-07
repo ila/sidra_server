@@ -162,6 +162,15 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 		throw ParserException("Staging view not found: " + staging_view);
 	}
 
+	// Verify the centralized table exists (created by CMV compilation)
+	auto centralized_info = server_con.TableInfo(centralized_table);
+	if (!centralized_info) {
+		throw ParserException("Centralized view '" + centralized_table +
+		                      "' not found. Define a centralized MV (CREATE CENTRALIZED MATERIALIZED VIEW) "
+		                      "on top of '" +
+		                      view_name + "' to enable flushing.");
+	}
+
 	string dimension_columns;
 	string join_names;
 	string table_column_names;
