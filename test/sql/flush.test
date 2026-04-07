@@ -229,3 +229,231 @@ SELECT city, total_steps, total_cals FROM sidra_centralized_view_combined ORDER 
 ----
 Berlin	100	500
 Paris	200	700
+
+# ============================================================
+# Test 8: Incremental flush — arrival filter prevents re-processing (Eq. 8)
+# ============================================================
+
+# Clean slate
+statement ok
+DELETE FROM sidra_staging_view_daily_steps_user;
+
+statement ok
+DELETE FROM sidra_centralized_view_daily_steps;
+
+statement ok
+UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps_user';
+
+statement ok
+UPDATE sidra_current_window SET sidra_window = 0 WHERE view_name = 'sidra_staging_view_daily_steps_user';
+
+# Batch 1: insert and flush
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Tokyo', 500, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
+
+statement ok
+pragma flush('daily_steps', 'duckdb');
+
+query II
+SELECT city, total_steps FROM sidra_centralized_view_daily_steps WHERE city = 'Tokyo';
+----
+Tokyo	500
+
+# Batch 2: insert more (arrival > last_refresh ensures only new rows processed)
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Tokyo', 600, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 2, 0);
+
+statement ok
+pragma flush('daily_steps', 'duckdb');
+
+# MERGE adds the delta (600) to existing (500) = 1100
+query II
+SELECT city, total_steps FROM sidra_centralized_view_daily_steps WHERE city = 'Tokyo';
+----
+Tokyo	1100
+
+# ============================================================
+# Test 9: Per-window grouping — each window gets its own row
+# ============================================================
+
+statement ok
+DELETE FROM sidra_staging_view_daily_steps_user;
+
+statement ok
+DELETE FROM sidra_centralized_view_daily_steps;
+
+statement ok
+UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps_user';
+
+# Data across 3 windows
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Berlin', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 1, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Berlin', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 1, 2, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Berlin', 300, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 2, 3, 0);
+
+statement ok
+pragma flush('daily_steps', 'duckdb');
+
+# 3 separate rows — one per window
+query III
+SELECT city, total_steps, sidra_window FROM sidra_centralized_view_daily_steps ORDER BY sidra_window;
+----
+Berlin	100	0
+Berlin	200	1
+Berlin	300	2
+
+# ============================================================
+# Test 10: Multiple clients same city/window — aggregated
+# ============================================================
+
+statement ok
+DELETE FROM sidra_staging_view_daily_steps_user;
+
+statement ok
+DELETE FROM sidra_centralized_view_daily_steps;
+
+statement ok
+UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'daily_steps_user';
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('NYC', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 10, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('NYC', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 11, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('NYC', 300, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 12, 0);
+
+statement ok
+pragma flush('daily_steps', 'duckdb');
+
+# All 3 clients aggregated into 1 row for (NYC, window 0)
+query III
+SELECT city, total_steps, sidra_window FROM sidra_centralized_view_daily_steps;
+----
+NYC	600	0
+
+# ============================================================
+# Test 11: Flush DMV directly — should error
+# ============================================================
+
+statement error
+pragma flush('daily_steps_user', 'duckdb');
+----
+No centralized MV defined
+
+# ============================================================
+# Test 12: TTL + min_agg combined (Eq. 12)
+# ============================================================
+
+statement ok
+DELETE FROM sidra_staging_view_agg_src;
+
+statement ok
+DELETE FROM sidra_centralized_view_agg_view;
+
+statement ok
+UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'agg_src';
+
+statement ok
+UPDATE sidra_current_window SET sidra_window = 5 WHERE view_name = 'sidra_staging_view_agg_src';
+
+# Window 1 (expired: 1 <= 2), 3 clients — meets min_agg but expired
+statement ok
+INSERT INTO sidra_staging_view_agg_src VALUES ('Madrid', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 1, 1, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_agg_src VALUES ('Madrid', 200, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 1, 2, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_agg_src VALUES ('Madrid', 300, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 1, 3, 0);
+
+# Window 4 (valid: 4 > 2), 3 clients — meets min_agg and valid
+statement ok
+INSERT INTO sidra_staging_view_agg_src VALUES ('Madrid', 400, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 4, 4, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_agg_src VALUES ('Madrid', 500, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 4, 5, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_agg_src VALUES ('Madrid', 600, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 4, 6, 0);
+
+# Window 4 (valid), 2 clients for Rome — below min_agg
+statement ok
+INSERT INTO sidra_staging_view_agg_src VALUES ('Rome', 50, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 4, 7, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_agg_src VALUES ('Rome', 60, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 4, 8, 0);
+
+statement ok
+pragma flush('agg_view', 'duckdb');
+
+# Only Madrid window 4 should pass (valid window + meets min_agg)
+# Madrid window 1: expired (filtered by TTL)
+# Rome window 4: only 2 clients (below min_agg=3)
+query III
+SELECT city, total_steps, sidra_window FROM sidra_centralized_view_agg_view ORDER BY city;
+----
+Madrid	1500	4
+
+# ============================================================
+# Test 13: Staging data persists after flush (not deleted)
+# ============================================================
+
+query I
+SELECT COUNT(*) FROM sidra_staging_view_agg_src;
+----
+8
+
+# ============================================================
+# Test 14: Metric columns exist and have default values
+# ============================================================
+
+# NYC row from Test 10 should have metric columns
+query I
+SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city = 'NYC' AND responsiveness IS NOT NULL;
+----
+1
+
+query I
+SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city = 'NYC' AND completeness IS NOT NULL;
+----
+1
+
+query I
+SELECT COUNT(*) FROM sidra_centralized_view_daily_steps WHERE city = 'NYC' AND buffer_size IS NOT NULL;
+----
+1
+
+# ============================================================
+# Test 15: Flush with multi-column GROUP BY DMV
+# ============================================================
+
+statement ok
+CREATE DECENTRALIZED MATERIALIZED VIEW city_date AS SELECT city, date, SUM(steps) AS total_steps FROM runs GROUP BY city, date WINDOW 24 TTL 72 REFRESH 6;
+
+statement ok
+CREATE CENTRALIZED MATERIALIZED VIEW city_date_totals AS SELECT city, date, SUM(total_steps) AS total_steps FROM city_date GROUP BY city, date REFRESH 12;
+
+statement ok
+INSERT INTO sidra_staging_view_city_date VALUES ('Berlin', '2024-01-01', 500, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 50, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_city_date VALUES ('Berlin', '2024-01-02', 600, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 51, 0);
+
+statement ok
+INSERT INTO sidra_staging_view_city_date VALUES ('Paris', '2024-01-01', 700, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 52, 0);
+
+statement ok
+pragma flush('city_date_totals', 'duckdb');
+
+query III
+SELECT city, date, total_steps FROM sidra_centralized_view_city_date_totals ORDER BY city, date;
+----
+Berlin	2024-01-01	500
+Berlin	2024-01-02	600
+Paris	2024-01-01	700
