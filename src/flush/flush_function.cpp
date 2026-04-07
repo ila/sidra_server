@@ -86,6 +86,36 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	if (!cmv_check->HasError() && cmv_check->RowCount() > 0) {
 		string cmv_delta_sql = cmv_check->GetValue(0, 0).ToString();
 		string cmv_merge_template = cmv_check->GetValue(1, 0).ToString();
+
+		// Pre-flush: delete expired rows from source staging views (TTL enforcement)
+		auto source_result = server_con.Query("SELECT source_view FROM sidra_cmv_queries WHERE view_name = '" +
+		                                      EscapeSingleQuotes(view_name) + "'");
+		if (!source_result->HasError() && source_result->RowCount() > 0) {
+			auto source_views_str = source_result->GetValue(0, 0).ToString();
+			auto source_list = StringUtil::Split(source_views_str, ',');
+			for (auto &sv : source_list) {
+				StringUtil::Trim(sv);
+				auto vc =
+				    server_con.Query("SELECT sidra_window, sidra_ttl FROM sidra_view_constraints WHERE view_name = '" +
+				                     EscapeSingleQuotes(sv) + "'");
+				auto cw = server_con.Query("SELECT sidra_window FROM sidra_current_window WHERE view_name = "
+				                           "'sidra_staging_view_" +
+				                           EscapeSingleQuotes(sv) + "'");
+				if (!vc->HasError() && vc->RowCount() > 0 && !cw->HasError() && cw->RowCount() > 0) {
+					auto window_size = vc->GetValue(0, 0).GetValue<int32_t>();
+					auto ttl = vc->GetValue(1, 0).GetValue<int32_t>();
+					auto current_window = cw->GetValue(0, 0).GetValue<int32_t>();
+					if (window_size > 0) {
+						int32_t expired_window = current_window - (ttl / window_size);
+						server_con.Query("DELETE FROM sidra_staging_view_" + sv +
+						                 " WHERE sidra_window <= " + to_string(expired_window));
+						SERVER_DEBUG_PRINT("[CMV FLUSH] Deleted expired rows (window <= " + to_string(expired_window) +
+						                   ") from sidra_staging_view_" + sv);
+					}
+				}
+			}
+		}
+
 		string cmv_flush_sql = "WITH ivm_cte AS (\n" + cmv_delta_sql + "\n)\n" + cmv_merge_template + ";";
 		SERVER_DEBUG_PRINT("[CMV FLUSH] " + view_name + ":\n" + cmv_flush_sql);
 		server_con.BeginTransaction();
