@@ -225,15 +225,13 @@ static void RedirectGetNodes(unique_ptr<LogicalOperator> &op, const string &old_
 	}
 }
 
-//! Add client_id to the GET node's output and return its OUTPUT binding position.
-//! Returns the ColumnBinding that can be used by parent nodes to reference client_id.
-static ColumnBinding AddClientIdToGet(unique_ptr<LogicalOperator> &op) {
+//! Add a named column to the GET node's output and return its OUTPUT binding position.
+static ColumnBinding AddColumnToGet(unique_ptr<LogicalOperator> &op, const string &column_name) {
 	if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op->Cast<LogicalGet>();
-		// Find client_id's schema position in the table
 		idx_t schema_idx = DConstants::INVALID_INDEX;
 		for (idx_t i = 0; i < get.names.size(); i++) {
-			if (get.names[i] == "client_id") {
+			if (get.names[i] == column_name) {
 				schema_idx = i;
 				break;
 			}
@@ -272,16 +270,54 @@ static ColumnBinding AddClientIdToGet(unique_ptr<LogicalOperator> &op) {
 			get.projection_ids.push_back(new_col_ids_pos);
 		}
 
-		SERVER_DEBUG_PRINT("[PLAN] Added client_id to GET output at position " + to_string(output_pos));
+		SERVER_DEBUG_PRINT("[PLAN] Added " + column_name + " to GET output at position " + to_string(output_pos));
 		return ColumnBinding(get.table_index, output_pos);
 	}
 	for (auto &child : op->children) {
-		auto result = AddClientIdToGet(child);
+		auto result = AddColumnToGet(child, column_name);
 		if (result.table_index != DConstants::INVALID_INDEX) {
 			return result;
 		}
 	}
 	return ColumnBinding();
+}
+
+static ColumnBinding AddClientIdToGet(unique_ptr<LogicalOperator> &op) {
+	return AddColumnToGet(op, "client_id");
+}
+
+//! Inject sidra_window as a GROUP BY column in the AGGREGATE node.
+//! Returns the ColumnBinding for sidra_window in the AGGREGATE's group output.
+static ColumnBinding InjectWindowGroupBy(unique_ptr<LogicalOperator> &op, ColumnBinding window_binding) {
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &agg = op->Cast<LogicalAggregate>();
+		auto window_ref = make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, window_binding);
+		idx_t group_idx = agg.groups.size();
+		agg.groups.push_back(std::move(window_ref));
+		SERVER_DEBUG_PRINT("[PLAN] Added sidra_window to GROUP BY at index " + to_string(group_idx));
+		// The group output binding: group_index + position
+		return ColumnBinding(agg.group_index, group_idx);
+	}
+	for (auto &child : op->children) {
+		auto result = InjectWindowGroupBy(child, window_binding);
+		if (result.table_index != DConstants::INVALID_INDEX) {
+			return result;
+		}
+	}
+	return ColumnBinding();
+}
+
+//! Inject sidra_window into the top-level PROJECTION node.
+static void InjectWindowProjection(unique_ptr<LogicalOperator> &op, ColumnBinding agg_window_binding) {
+	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto window_ref = make_uniq<BoundColumnRefExpression>("sidra_window", LogicalType::INTEGER, agg_window_binding);
+		op->expressions.push_back(std::move(window_ref));
+		SERVER_DEBUG_PRINT("[PLAN] Added sidra_window to PROJECTION");
+		return;
+	}
+	for (auto &child : op->children) {
+		InjectWindowProjection(child, agg_window_binding);
+	}
 }
 
 //! Inject COUNT(DISTINCT client_id) >= min_agg as a HAVING filter into the AGGREGATE node.
@@ -422,11 +458,12 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 	if (data.scope == TableScope::centralized) {
 		// Compile CMV: OpenIVM for MERGE template, plan traversal + LPTS for delta SQL
 
-		// Step 1: Load OpenIVM and compile MV in shadow DB
+		// Step 1: Load OpenIVM, inject sidra_window into query plan, compile MV
 		auto load_r = shadow_con.Query("LOAD './openivm.duckdb_extension'");
 		if (load_r->HasError()) {
 			throw ParserException("Failed to load OpenIVM extension: " + load_r->GetError());
 		}
+
 		string create_mv = "CREATE MATERIALIZED VIEW " + view_name + " AS " + view_query;
 		auto mv_r = shadow_con.Query(create_mv);
 		if (mv_r->HasError()) {
@@ -479,8 +516,7 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		// Use first source for backward compat in single-source case
 		string staging_table = "sidra_staging_view_" + source_views[0];
 
-		// Step 3: Plan the CMV query, walk the plan, replace GET nodes, call LPTS
-		// Strip wrapping from stored query
+		// Step 3: Plan the CMV query, replace GET nodes, call LPTS
 		string clean_query = view_query;
 		StringUtil::Trim(clean_query);
 		if (!clean_query.empty() && clean_query.back() == ';') {
@@ -506,6 +542,8 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		for (auto &sv : source_views) {
 			RedirectGetNodes(plan, sv, "sidra_staging_view_" + sv, *shadow_con.context);
 		}
+
+		// sidra_window and metric columns are added via ALTER TABLE after CMV creation
 
 		// Inject HAVING COUNT(DISTINCT client_id) >= min_agg at the plan level
 		if (vc.min_agg > 0) {
@@ -599,6 +637,14 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		}
 		cmv_ddl = cmv_ddl.substr(0, cmv_ddl.size() - 2) + ")";
 		metadata_queries.push_back(cmv_ddl);
+
+		// Add observability columns via ALTER TABLE (Table 1 + Table 2 in paper)
+		metadata_queries.push_back("ALTER TABLE " + cmv_data_table + " ADD COLUMN sidra_window INT DEFAULT 0");
+		metadata_queries.push_back("ALTER TABLE " + cmv_data_table +
+		                           " ADD COLUMN responsiveness NUMERIC(5,2) DEFAULT 0");
+		metadata_queries.push_back("ALTER TABLE " + cmv_data_table +
+		                           " ADD COLUMN completeness NUMERIC(5,2) DEFAULT 100");
+		metadata_queries.push_back("ALTER TABLE " + cmv_data_table + " ADD COLUMN buffer_size NUMERIC(5,2) DEFAULT 0");
 
 		// Store metadata
 		metadata_queries.push_back("INSERT OR IGNORE INTO sidra_view_constraints VALUES('" +

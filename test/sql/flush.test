@@ -142,7 +142,7 @@ INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Rome', 200, now()::TIME
 statement ok
 pragma flush('daily_steps', 'duckdb');
 
-# Only valid windows (3+5) aggregated: 100+200=300 (window 1 excluded by TTL)
+# Valid windows (3+5) aggregated: 100+200=300 (window 1 excluded by TTL)
 query II
 SELECT city, total_steps FROM sidra_centralized_view_daily_steps WHERE city = 'Rome';
 ----
