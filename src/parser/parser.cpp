@@ -500,18 +500,11 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		planner.CreatePlan(std::move(query_parser.statements[0]));
 		auto plan = std::move(planner.plan);
 
-		// Walk plan: replace GET(source_view) → GET(centralized_table) for ALL source views
-		// CMVs read from centralized tables (which contain the flushed data after DMV flush)
+		// Walk plan: replace GET(source_view) → GET(staging_view) for ALL source views
+		// CMVs read from staging views (SMVs) per the paper (Eq. 10), apply min_agg,
+		// and write to the centralized view (CMV data table)
 		for (auto &sv : source_views) {
-			// Ensure centralized table exists in shadow DB for plan resolution
-			auto cv_info = shadow_con.TableInfo("sidra_centralized_view_" + sv);
-			if (!cv_info) {
-				string cv_ddl = ConstructTable(shadow_con, sv, false);
-				cv_ddl = std::regex_replace(cv_ddl, std::regex(R"(create table )", std::regex_constants::icase),
-				                            "CREATE TABLE IF NOT EXISTS ");
-				shadow_con.Query(cv_ddl);
-			}
-			RedirectGetNodes(plan, sv, "sidra_centralized_view_" + sv, *shadow_con.context);
+			RedirectGetNodes(plan, sv, "sidra_staging_view_" + sv, *shadow_con.context);
 		}
 
 		// Inject HAVING COUNT(DISTINCT client_id) >= min_agg at the plan level
