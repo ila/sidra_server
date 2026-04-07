@@ -394,8 +394,8 @@ static string ConstructTable(Connection &con, const string &view_name_in, bool i
 		definition += column.GetName() + " " + StringUtil::Lower(column.GetType().ToString()) + ", ";
 	}
 	if (is_staging) {
-		definition +=
-		    "generation timestamptz, arrival timestamptz, sidra_window int, client_id ubigint, action tinyint);\n";
+		definition += "generation timestamptz, arrival timestamptz, sidra_window int not null default 0, "
+		              "client_id ubigint, action tinyint);\n";
 	} else {
 		definition += "sidra_window int, client_id ubigint, responsiveness numeric(5, 2), "
 		              "completeness numeric(5, 2), buffer_size numeric(5, 2));\n";

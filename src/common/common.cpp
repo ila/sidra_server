@@ -78,10 +78,11 @@ void EnsureMetadataTables(Connection &con) {
 	    "last_refresh TIMESTAMP)",
 	    "CREATE TABLE IF NOT EXISTS sidra_table_constraints(table_name VARCHAR, column_name VARCHAR, sidra_sensitive "
 	    "BOOL, sidra_fact BOOL, sidra_dimension BOOL, PRIMARY KEY(table_name, column_name))",
-	    "CREATE TABLE IF NOT EXISTS sidra_view_constraints(view_name VARCHAR, sidra_window INT, sidra_ttl TINYINT, "
-	    "sidra_refresh TINYINT, sidra_min_agg TINYINT, last_refresh TIMESTAMP, PRIMARY KEY(view_name))",
-	    "CREATE TABLE IF NOT EXISTS sidra_current_window(view_name VARCHAR, sidra_window INT, last_update TIMESTAMP, "
-	    "PRIMARY KEY(view_name))",
+	    "CREATE TABLE IF NOT EXISTS sidra_view_constraints(view_name VARCHAR, sidra_window INT NOT NULL DEFAULT 0, "
+	    "sidra_ttl INT NOT NULL DEFAULT 0, sidra_refresh INT NOT NULL DEFAULT 0, sidra_min_agg INT NOT NULL DEFAULT 0, "
+	    "last_refresh TIMESTAMP, PRIMARY KEY(view_name))",
+	    "CREATE TABLE IF NOT EXISTS sidra_current_window(view_name VARCHAR, sidra_window INT NOT NULL DEFAULT 0, "
+	    "last_update TIMESTAMP, PRIMARY KEY(view_name))",
 	    "CREATE TABLE IF NOT EXISTS sidra_cmv_queries(view_name VARCHAR PRIMARY KEY, source_view VARCHAR, "
 	    "delta_sql VARCHAR, merge_template VARCHAR, data_table_name VARCHAR, ivm_type VARCHAR, last_flush TIMESTAMP "
 	    "DEFAULT now())",

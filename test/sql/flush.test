@@ -457,3 +457,12 @@ SELECT city, date, total_steps FROM sidra_centralized_view_city_date_totals ORDE
 Berlin	2024-01-01	500
 Berlin	2024-01-02	600
 Paris	2024-01-01	700
+
+# ============================================================
+# Test 16: NULL window rejected by NOT NULL constraint
+# ============================================================
+
+statement error
+INSERT INTO sidra_staging_view_daily_steps_user VALUES ('Test', 100, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, NULL, 99, 0);
+----
+NOT NULL constraint
