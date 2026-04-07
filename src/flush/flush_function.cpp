@@ -5,60 +5,12 @@
 #include "server_debug.hpp"
 #include "update_metrics.hpp"
 
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/planner/binder.hpp"
-
-#include <regex>
 
 namespace duckdb {
 
-static int flush_run = 0; // benchmark run counter
-
-static string UpdateWithMinimumAggregation(string &staging_view, string &centralized_table, string &column_names,
-                                           string &join_names, string &dimension_columns, int minimum_aggregation) {
-	// Match handwritten script pattern: mark rows meeting min_agg threshold,
-	// insert into centralized, delete marked from staging.
-	// Also filter by expired window (fixes TODO #51).
-	string query = "update " + staging_view + " x\nset action = 2 \nfrom (\n\tselect ";
-	query += dimension_columns + ", ";
-	query += "count(distinct client_id)\n\t";
-	query += "from " + staging_view + " \n\t";
-	query += "where sidra_window > (select expired_window from threshold_window)\n\t";
-	query += "group by " + dimension_columns + "\n\t";
-	query += "having count(distinct client_id) >= " + std::to_string(minimum_aggregation);
-	query += ") y\n";
-	query += "where " + join_names.substr(0, join_names.size() - 6) + ";\n\n";
-
-	query += "insert into " + centralized_table + " by name\nselect " + column_names + " \nfrom " + staging_view +
-	         " \nwhere action = 2;\n\n";
-	query += "delete from " + staging_view + " \nwhere action = 2;\n\n";
-
-	return query;
-}
-
-static string UpdateWithoutMinimumAggregation(string &staging_view, string &centralized_table, string &column_names,
-                                              const string &extract_metadata) {
-	// Insert non-expired rows that arrived AFTER last flush (avoid re-processing)
-	string query = "insert into " + centralized_table + " by name \n";
-	query += "select " + column_names + "\n";
-	query += "from " + staging_view + "\n";
-	query += "where sidra_window > (select expired_window from threshold_window)\n";
-	query += "and arrival > (select last_refresh from stats);\n\n";
-
-	// Delete expired rows from staging (needs its own CTE since it's a separate statement)
-	query += extract_metadata;
-	query += "delete from " + staging_view + "\n";
-	query += "where sidra_window <= (select expired_window from threshold_window);\n\n";
-
-	return query;
-}
-
 void FlushFunction(ClientContext &context, const FunctionParameters &parameters) {
-	// TODO: implement client deletes (opt out)
-	// TODO: add index logic for upsert
-
 	auto database = StringValue::Get(parameters.values[1]);
 	if (database != "duckdb" && database != "postgres") {
 		throw ParserException("Invalid database type: " + database + " - only duckdb and postgres are supported!");
@@ -72,274 +24,113 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	string config_file = "server.config";
 	auto config = ParseConfig(config_path, config_file);
 
-	// Use the caller's database connection — opening a separate DuckDB instance
-	// on the same file causes WAL isolation (writes aren't visible to the caller).
 	Connection server_con(*context.db);
-	string server_db_name = context.db->config.options.database_path;
-
 	auto view_name = StringValue::Get(parameters.values[0]);
 
-	// Check if this is a CMV (centralized materialized view) — flush via delta_sql + merge_template
-	auto cmv_check = server_con.Query("SELECT delta_sql, merge_template, data_table_name FROM sidra_cmv_queries "
-	                                  "WHERE view_name = '" +
+	// Look up CMV metadata
+	auto cmv_check = server_con.Query("SELECT delta_sql, merge_template, data_table_name, source_view "
+	                                  "FROM sidra_cmv_queries WHERE view_name = '" +
 	                                  EscapeSingleQuotes(view_name) + "'");
-	if (!cmv_check->HasError() && cmv_check->RowCount() > 0) {
-		string cmv_delta_sql = cmv_check->GetValue(0, 0).ToString();
-		string cmv_merge_template = cmv_check->GetValue(1, 0).ToString();
+	if (cmv_check->HasError() || cmv_check->RowCount() == 0) {
+		// Check if staging view exists (user might be flushing a DMV without a CMV)
+		auto staging_check = server_con.TableInfo("sidra_staging_view_" + view_name);
+		if (staging_check) {
+			throw ParserException("No centralized MV defined for '" + view_name +
+			                      "'. Create a centralized MV (CREATE CENTRALIZED MATERIALIZED VIEW) first.");
+		}
+		throw ParserException("View '" + view_name + "' not found in SIDRA metadata.");
+	}
 
-		// Inject TTL filter into delta SQL by adding WHERE clause to staging view scans
-		// TODO: inject TTL filter at the plan level instead of string replacement
-		auto source_result = server_con.Query("SELECT source_view FROM sidra_cmv_queries WHERE view_name = '" +
-		                                      EscapeSingleQuotes(view_name) + "'");
-		if (!source_result->HasError() && source_result->RowCount() > 0) {
-			auto source_views_str = source_result->GetValue(0, 0).ToString();
-			auto source_list = StringUtil::Split(source_views_str, ',');
-			for (auto &sv : source_list) {
-				StringUtil::Trim(sv);
-				auto vc =
-				    server_con.Query("SELECT sidra_window, sidra_ttl FROM sidra_view_constraints WHERE view_name = '" +
-				                     EscapeSingleQuotes(sv) + "'");
-				auto cw = server_con.Query("SELECT sidra_window FROM sidra_current_window WHERE view_name = "
-				                           "'sidra_staging_view_" +
-				                           EscapeSingleQuotes(sv) + "'");
-				if (vc->HasError()) {
-					Printer::Print("Warning: could not look up view constraints for '" + sv + "': " + vc->GetError());
-				} else if (cw->HasError()) {
-					Printer::Print("Warning: could not look up current window for '" + sv + "': " + cw->GetError());
-				} else if (vc->RowCount() == 0) {
-					Printer::Print("Warning: no view constraints found for '" + sv + "' — TTL filter not applied");
-				} else if (cw->RowCount() == 0) {
-					Printer::Print("Warning: no current window found for '" + sv + "' — TTL filter not applied");
-				} else {
-					auto window_size = vc->GetValue(0, 0).GetValue<int32_t>();
-					auto ttl = vc->GetValue(1, 0).GetValue<int32_t>();
-					auto current_window = cw->GetValue(0, 0).GetValue<int32_t>();
-					if (window_size > 0) {
-						int32_t expired_window = current_window - (ttl / window_size);
-						string staging_table = "sidra_staging_view_" + sv;
-						string ttl_filter = staging_table + " WHERE sidra_window > " + to_string(expired_window);
-						cmv_delta_sql = StringUtil::Replace(cmv_delta_sql, staging_table + ")", ttl_filter + ")");
-						SERVER_DEBUG_PRINT("[CMV FLUSH] Injected TTL filter (window > " + to_string(expired_window) +
-						                   ") for " + staging_table);
-					} else {
-						Printer::Print("Warning: window_size is 0 for '" + sv + "' — TTL filter not applied");
-					}
-				}
+	string cmv_delta_sql = cmv_check->GetValue(0, 0).ToString();
+	string cmv_merge_template = cmv_check->GetValue(1, 0).ToString();
+	string centralized_view = cmv_check->GetValue(2, 0).ToString();
+	string source_views_str = cmv_check->GetValue(3, 0).ToString();
+	auto source_list = StringUtil::Split(source_views_str, ',');
+
+	// Inject TTL + arrival filters into staging view scans
+	for (auto &sv : source_list) {
+		StringUtil::Trim(sv);
+		string staging_table = "sidra_staging_view_" + sv;
+
+		auto vc = server_con.Query("SELECT sidra_window, sidra_ttl, last_refresh FROM sidra_view_constraints "
+		                           "WHERE view_name = '" +
+		                           EscapeSingleQuotes(sv) + "'");
+		auto cw = server_con.Query("SELECT sidra_window FROM sidra_current_window WHERE view_name = '" +
+		                           EscapeSingleQuotes(staging_table) + "'");
+
+		if (vc->HasError() || vc->RowCount() == 0) {
+			Printer::Print("Warning: no view constraints found for '" + sv + "' — filters not applied");
+			continue;
+		}
+		if (cw->HasError() || cw->RowCount() == 0) {
+			Printer::Print("Warning: no current window found for '" + staging_table + "' — TTL not applied");
+		}
+
+		auto window_size = vc->GetValue(0, 0).GetValue<int32_t>();
+		auto ttl = vc->GetValue(1, 0).GetValue<int32_t>();
+		auto last_refresh = vc->GetValue(2, 0).ToString();
+
+		// Build WHERE clause: TTL filter + arrival filter
+		string where_parts;
+		if (!cw->HasError() && cw->RowCount() > 0 && window_size > 0) {
+			auto current_window = cw->GetValue(0, 0).GetValue<int32_t>();
+			int32_t expired_window = current_window - (ttl / window_size);
+			where_parts += "sidra_window > " + to_string(expired_window);
+		}
+		if (last_refresh != "NULL" && !last_refresh.empty()) {
+			if (!where_parts.empty()) {
+				where_parts += " AND ";
 			}
+			where_parts += "arrival > '" + EscapeSingleQuotes(last_refresh) + "'::TIMESTAMPTZ";
 		}
 
-		string cmv_flush_sql = "WITH ivm_cte AS (\n" + cmv_delta_sql + "\n)\n" + cmv_merge_template + ";";
-		SERVER_DEBUG_PRINT("[CMV FLUSH] " + view_name + ":\n" + cmv_flush_sql);
-		server_con.BeginTransaction();
-		auto cmv_r = server_con.Query(cmv_flush_sql);
-		if (cmv_r->HasError()) {
-			server_con.Rollback();
-			throw ParserException("CMV flush failed for '" + view_name + "': " + cmv_r->GetError());
-		}
-		server_con.Commit();
-		return;
-	}
-
-	auto staging_view = "sidra_staging_view_" + view_name;
-	auto centralized_table = "sidra_centralized_view_" + view_name;
-
-	LocalFileSystem fs;
-	string file_name = staging_view + "_flush.sql";
-
-	// If a pre-compiled flush script exists, execute it directly
-	if (fs.FileExists(file_name)) {
-		bool append = flush_run > 0;
-		string queries = ReadFile(file_name);
-		ExecuteCommitLogAndWriteQueries(server_con, queries, file_name, view_name, append, flush_run, false);
-		flush_run++;
-		return;
-	}
-
-	if (view_name.find("_min_agg") != string::npos) {
-		throw ParserException("View name cannot contain '_min_agg' - this is reserved for internal use!");
-	}
-
-	SERVER_DEBUG_PRINT("[FLUSH] db=" + server_db_name + " staging=" + staging_view +
-	                   " centralized=" + centralized_table);
-	auto staging_count = server_con.Query("SELECT COUNT(*) FROM " + staging_view);
-	if (!staging_count->HasError()) {
-		SERVER_DEBUG_PRINT("[FLUSH] staging rows: " + staging_count->GetValue(0, 0).ToString());
-	}
-
-	// Look up the staging view in the server DB
-	auto staging_info = server_con.TableInfo(staging_view);
-	if (!staging_info) {
-		throw ParserException("Staging view not found: " + staging_view);
-	}
-
-	// Verify the centralized table exists (created by CMV compilation)
-	auto centralized_info = server_con.TableInfo(centralized_table);
-	if (!centralized_info) {
-		throw ParserException("Centralized view '" + centralized_table +
-		                      "' not found. Define a centralized MV (CREATE CENTRALIZED MATERIALIZED VIEW) "
-		                      "on top of '" +
-		                      view_name + "' to enable flushing.");
-	}
-
-	string dimension_columns;
-	string join_names;
-	string table_column_names;
-
-	// CTE to extract TTL metadata (metadata is in the server DB, not an external sidra_parser.db)
-	string extract_metadata = "WITH stats AS (\n"
-	                          "\tSELECT sidra_window, sidra_ttl, last_refresh FROM sidra_view_constraints\n"
-	                          "\tWHERE view_name = '" +
-	                          EscapeSingleQuotes(view_name) +
-	                          "'),\n"
-	                          "current_window AS (\n"
-	                          "\tSELECT sidra_window FROM sidra_current_window\n"
-	                          "\tWHERE view_name = 'sidra_staging_view_" +
-	                          EscapeSingleQuotes(view_name) +
-	                          "'),\n"
-	                          "threshold_window AS (\n"
-	                          "\tSELECT cw.sidra_window - (s.sidra_ttl / s.sidra_window) AS expired_window\n"
-	                          "\tFROM current_window cw, stats s)\n";
-
-	// Query metadata from the server DB (not sidra_parser.db)
-	string min_agg_query =
-	    "select sidra_min_agg from sidra_view_constraints where view_name = '" + EscapeSingleQuotes(view_name) + "';";
-	auto r = server_con.Query(min_agg_query);
-	if (r->HasError()) {
-		throw ParserException("Error while querying view metadata: " + r->GetError());
-	}
-	if (r->RowCount() == 0) {
-		throw ParserException("View metadata not found for: " + view_name);
-	}
-	auto minimum_aggregation = std::stoi(r->GetValue(0, 0).ToString());
-
-	// Get the view query to find referenced tables
-	string view_query_sql = "select query from sidra_tables where name = '" + EscapeSingleQuotes(view_name) + "';";
-	auto view_query_result = server_con.Query(view_query_sql);
-	if (view_query_result->HasError()) {
-		throw ParserException("Error while querying view definition: " + view_query_result->GetError());
-	}
-
-	// Find dimension columns: columns in the staging view that are DIMENSION-annotated
-	// AND actually present in the view's output (not all base table dimensions)
-	unordered_set<string> staging_columns;
-	for (auto &column : staging_info->columns) {
-		auto col_name = column.GetName();
-		if (col_name != "action" && col_name != "generation" && col_name != "arrival" && col_name != "sidra_window" &&
-		    col_name != "client_id") {
-			staging_columns.insert(col_name);
+		if (!where_parts.empty()) {
+			string filter = staging_table + " WHERE " + where_parts;
+			cmv_delta_sql = StringUtil::Replace(cmv_delta_sql, staging_table + ")", filter + ")");
+			SERVER_DEBUG_PRINT("[FLUSH] Injected filter for " + staging_table + ": " + where_parts);
 		}
 	}
+
+	// Execute the CMV flush (delta query + MERGE)
+	string cmv_flush_sql = "WITH ivm_cte AS (\n" + cmv_delta_sql + "\n)\n" + cmv_merge_template + ";";
+	SERVER_DEBUG_PRINT("[FLUSH] SQL:\n" + cmv_flush_sql);
 
 	server_con.BeginTransaction();
-	auto table_names = server_con.GetTableNames(view_query_result->GetValue(0, 0).ToString());
-	server_con.Rollback();
-
-	string in_table_names = "(";
-	for (auto &table : table_names) {
-		in_table_names += "'" + EscapeSingleQuotes(table) + "', ";
+	auto cmv_r = server_con.Query(cmv_flush_sql);
+	if (cmv_r->HasError()) {
+		server_con.Rollback();
+		throw ParserException("Flush failed for '" + view_name + "': " + cmv_r->GetError());
 	}
-	in_table_names = in_table_names.substr(0, in_table_names.size() - 2) + ")";
+	server_con.Commit();
 
-	auto dim_columns_query = "select column_name from sidra_table_constraints where sidra_dimension = 1 "
-	                         "and table_name in " +
-	                         in_table_names + ";";
-	auto dim_columns = server_con.Query(dim_columns_query);
-	if (dim_columns->HasError()) {
-		throw ParserException("Error while querying dimension columns: " + dim_columns->GetError());
-	}
-	for (size_t i = 0; i < dim_columns->RowCount(); i++) {
-		auto column = dim_columns->GetValue(0, i).ToString();
-		// Only include dimension columns that are actually in the staging view
-		if (staging_columns.count(column)) {
-			dimension_columns += column + ", ";
-			join_names += "x." + column + " = y." + column + " \nand ";
-		}
+	// Update metrics (read from staging, write to centralized)
+	string first_staging = "sidra_staging_view_" + source_list[0];
+	StringUtil::Trim(first_staging);
+
+	auto resp_sql = UpdateResponsiveness(first_staging, centralized_view);
+	auto resp_r = server_con.Query(resp_sql);
+	if (resp_r->HasError()) {
+		Printer::Print("Warning: responsiveness update failed: " + resp_r->GetError());
 	}
 
-	dimension_columns += "sidra_window";
-	join_names += "x.sidra_window = y.sidra_window \nand ";
-
-	// Get column names from the staging view (excluding metadata columns)
-	for (auto &column : staging_info->columns) {
-		auto col_name = column.GetName();
-		if (col_name != "action" && col_name != "generation" && col_name != "arrival") {
-			table_column_names += col_name + ", ";
-		}
-	}
-	table_column_names = table_column_names.substr(0, table_column_names.size() - 2);
-
-	// For DuckDB mode, everything is in one DB — no attach needed.
-	// For Postgres mode, attach the external DB.
-	string attach_query;
-	string detach_query;
-	if (database == "postgres") {
-		// TODO: extend config to support postgres credentials
-		string postgres_credentials = "'dbname=sidra_client user=ubuntu password=test host=localhost'";
-		attach_query = "attach if not exists " + postgres_credentials + " as sidra_client (type postgres);\n\n";
-		detach_query = "detach sidra_client;\n\n";
+	auto buf_sql = UpdateBufferSize(first_staging, centralized_view);
+	auto buf_r = server_con.Query(buf_sql);
+	if (buf_r->HasError()) {
+		Printer::Print("Warning: buffer_size update failed: " + buf_r->GetError());
 	}
 
-	// Build the main data movement query
-	string update_query;
-	if (minimum_aggregation > 1) {
-		update_query =
-		    extract_metadata + UpdateWithMinimumAggregation(staging_view, centralized_table, table_column_names,
-		                                                    join_names, dimension_columns, minimum_aggregation);
-	} else {
-		update_query = extract_metadata + UpdateWithoutMinimumAggregation(staging_view, centralized_table,
-		                                                                  table_column_names, extract_metadata);
+	// Cleanup expired clients
+	auto cleanup_sql = CleanupExpiredClients(config);
+	server_con.Query(cleanup_sql);
+
+	// Update last_refresh for all source views so next flush only reads new arrivals
+	for (auto &sv : source_list) {
+		StringUtil::Trim(sv);
+		server_con.Query("UPDATE sidra_view_constraints SET last_refresh = now()::TIMESTAMP WHERE view_name = '" +
+		                 EscapeSingleQuotes(sv) + "'");
 	}
 
-	// Build metric updates
-	string update_responsiveness = UpdateResponsiveness(view_name);
-	string update_completeness;
-	if (minimum_aggregation > 1) {
-		update_completeness = extract_metadata.substr(0, extract_metadata.size() - 1) + UpdateCompleteness(view_name);
-	} else {
-		update_completeness =
-		    "update sidra_centralized_view_" + view_name + " sidra_metadata_update\nset completeness = 100;\n\n";
-	}
-	string update_buffer_size;
-	if (minimum_aggregation > 1) {
-		update_buffer_size = UpdateBufferSize(view_name);
-	} else {
-		update_buffer_size =
-		    "update sidra_centralized_view_" + view_name + " sidra_metadata_update\nset buffer_size = 0;\n\n";
-	}
-	string cleanup_clients = CleanupExpiredClients(config);
-
-	// TTL cleanup in staging (only for min_agg path — non-min-agg already deletes expired)
-	string ttl_cleanup;
-	if (minimum_aggregation > 1) {
-		ttl_cleanup = extract_metadata + "delete from " + staging_view +
-		              "\nwhere sidra_window <= (SELECT expired_window FROM threshold_window);\n\n";
-	}
-
-	// Zero aggregate cleanup (matching handwritten scripts)
-	string zero_cleanup = "delete from " + centralized_table + "\nwhere " +
-	                      table_column_names.substr(table_column_names.find_last_of(',') + 2) + " = 0;\n\n";
-
-	// Update last_refresh timestamp so next flush only processes new arrivals
-	string update_last_refresh =
-	    "UPDATE sidra_view_constraints SET last_refresh = now()::TIMESTAMP WHERE view_name = '" +
-	    EscapeSingleQuotes(view_name) + "';\n\n";
-
-	// Assemble the complete flush script
-	string queries;
-	if (database == "duckdb") {
-		queries = attach_query + update_query + detach_query + cleanup_clients + update_responsiveness + attach_query +
-		          update_completeness + ttl_cleanup + update_buffer_size + zero_cleanup + update_last_refresh +
-		          detach_query;
-	} else if (database == "postgres") {
-		queries = attach_query + update_query + cleanup_clients + update_responsiveness + update_completeness +
-		          ttl_cleanup + update_buffer_size + zero_cleanup + update_last_refresh;
-	}
-
-	bool append = flush_run > 0;
-	ExecuteCommitLogAndWriteQueries(server_con, queries, file_name, view_name, append, flush_run, true);
-	flush_run++;
-
-	// CMVs are flushed explicitly via pragma flush('cmv_name', 'duckdb')
+	SERVER_DEBUG_PRINT("[FLUSH] Completed for CMV: " + view_name);
 }
 
 } // namespace duckdb

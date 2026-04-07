@@ -106,6 +106,10 @@ SELECT COUNT(*) FROM sidra_staging_view_agg_src;
 statement ok
 INSERT INTO sidra_staging_view_agg_src VALUES ('London', 300, now()::TIMESTAMPTZ, now()::TIMESTAMPTZ, 0, 3, 0);
 
+# Reset last_refresh so next flush picks up all rows
+statement ok
+UPDATE sidra_view_constraints SET last_refresh = '1970-01-01'::TIMESTAMP WHERE view_name = 'agg_src';
+
 statement ok
 pragma flush('agg_view', 'duckdb');
 
@@ -174,7 +178,7 @@ SELECT COUNT(*) FROM sidra_centralized_view_daily_steps;
 statement error
 pragma flush('nonexistent_view', 'duckdb');
 ----
-Staging view not found
+not found
 
 # ============================================================
 # Test 6: Invalid database type — should error
