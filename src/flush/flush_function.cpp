@@ -87,7 +87,8 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 		string cmv_delta_sql = cmv_check->GetValue(0, 0).ToString();
 		string cmv_merge_template = cmv_check->GetValue(1, 0).ToString();
 
-		// Pre-flush: delete expired rows from source staging views (TTL enforcement)
+		// Inject TTL filter into delta SQL by adding WHERE clause to staging view scans
+		// TODO: inject TTL filter at the plan level instead of string replacement
 		auto source_result = server_con.Query("SELECT source_view FROM sidra_cmv_queries WHERE view_name = '" +
 		                                      EscapeSingleQuotes(view_name) + "'");
 		if (!source_result->HasError() && source_result->RowCount() > 0) {
@@ -107,10 +108,11 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 					auto current_window = cw->GetValue(0, 0).GetValue<int32_t>();
 					if (window_size > 0) {
 						int32_t expired_window = current_window - (ttl / window_size);
-						server_con.Query("DELETE FROM sidra_staging_view_" + sv +
-						                 " WHERE sidra_window <= " + to_string(expired_window));
-						SERVER_DEBUG_PRINT("[CMV FLUSH] Deleted expired rows (window <= " + to_string(expired_window) +
-						                   ") from sidra_staging_view_" + sv);
+						string staging_table = "sidra_staging_view_" + sv;
+						string ttl_filter = staging_table + " WHERE sidra_window > " + to_string(expired_window);
+						cmv_delta_sql = StringUtil::Replace(cmv_delta_sql, staging_table + ")", ttl_filter + ")");
+						SERVER_DEBUG_PRINT("[CMV FLUSH] Injected TTL filter (window > " + to_string(expired_window) +
+						                   ") for " + staging_table);
 					}
 				}
 			}
