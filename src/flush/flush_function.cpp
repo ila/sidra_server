@@ -288,43 +288,7 @@ void FlushFunction(ClientContext &context, const FunctionParameters &parameters)
 	ExecuteCommitLogAndWriteQueries(server_con, queries, file_name, view_name, append, flush_run, true);
 	flush_run++;
 
-	// Phase 3: Update dependent CMVs
-	// delta_sql reads from centralized tables (no timestamps), merge_template does the upsert
-	auto cmv_result =
-	    server_con.Query("SELECT view_name, delta_sql, merge_template, data_table_name "
-	                     "FROM sidra_cmv_queries WHERE source_view = '" +
-	                     EscapeSingleQuotes(view_name) + "' OR source_view LIKE '" + EscapeSingleQuotes(view_name) +
-	                     ",%' OR source_view LIKE '%," + EscapeSingleQuotes(view_name) + "' OR source_view LIKE '%," +
-	                     EscapeSingleQuotes(view_name) + ",%'");
-	if (cmv_result->HasError() || cmv_result->RowCount() == 0) {
-		return; // No dependent CMVs
-	}
-
-	for (idx_t i = 0; i < cmv_result->RowCount(); i++) {
-		string cmv_name = cmv_result->GetValue(0, i).ToString();
-		string cmv_delta_sql = cmv_result->GetValue(1, i).ToString();
-		string cmv_merge_template = cmv_result->GetValue(2, i).ToString();
-		string cmv_data_table = cmv_result->GetValue(3, i).ToString();
-
-		// Assemble fresh SQL at flush time (no stale timestamps)
-		string cmv_flush_sql = "WITH ivm_cte AS (\n" + cmv_delta_sql + "\n)\n" + cmv_merge_template + ";";
-
-		SERVER_DEBUG_PRINT("[CMV FLUSH] Executing for: " + cmv_name);
-		SERVER_DEBUG_PRINT("[CMV FLUSH] SQL:\n" + cmv_flush_sql);
-
-		server_con.BeginTransaction();
-		auto cmv_r = server_con.Query(cmv_flush_sql);
-		if (cmv_r->HasError()) {
-			server_con.Rollback();
-			SERVER_DEBUG_PRINT("[CMV FLUSH] ERROR: " + cmv_r->GetError());
-			Printer::Print("Warning: CMV update failed for " + cmv_name + ": " + cmv_r->GetError());
-		} else {
-			server_con.Commit();
-			server_con.Query("UPDATE sidra_cmv_queries SET last_flush = now() WHERE view_name = '" +
-			                 EscapeSingleQuotes(cmv_name) + "'");
-			SERVER_DEBUG_PRINT("[CMV FLUSH] Successfully updated CMV: " + cmv_name);
-		}
-	}
+	// CMVs are flushed explicitly via pragma flush('cmv_name', 'duckdb')
 }
 
 } // namespace duckdb
