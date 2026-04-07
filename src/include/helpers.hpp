@@ -13,10 +13,10 @@ struct SIDRAConstraints {
 };
 
 struct SIDRAViewConstraint {
-	uint8_t window = 0;
-	uint8_t ttl = 0;
-	uint8_t refresh = 0;
-	uint8_t min_agg = 0;
+	int32_t window = 0;
+	int32_t ttl = 0;
+	int32_t refresh = 0;
+	int32_t min_agg = 0;
 };
 
 struct SIDRASelectOption {

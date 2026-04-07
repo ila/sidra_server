@@ -513,7 +513,9 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 			if (client_id_binding.table_index != DConstants::INVALID_INDEX) {
 				InjectMinAggHaving(plan, plan, static_cast<int>(vc.min_agg), client_id_binding, *shadow_con.context);
 			} else {
-				SERVER_DEBUG_PRINT("[CMV] WARNING: client_id not found in staging table");
+				throw ParserException("MINIMUM AGGREGATION requires client_id column in staging view, "
+				                      "but it was not found for CMV '" +
+				                      view_name + "'");
 			}
 		}
 

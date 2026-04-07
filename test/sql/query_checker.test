@@ -32,6 +32,12 @@ CREATE DECENTRALIZED TABLE t4 (id INT SENSITIVE, city VARCHAR);
 ----
 Decentralized tables must have at least one FACT column
 
+# Multiple annotations on one column
+statement error
+CREATE DECENTRALIZED TABLE t5 (id INT SENSITIVE FACT, city VARCHAR DIMENSION);
+----
+multiple annotations
+
 # ============================================================
 # Setup: create base table
 # ============================================================

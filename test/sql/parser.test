@@ -138,6 +138,16 @@ CREATE CENTRALIZED MATERIALIZED VIEW sidra_staging_view_test AS SELECT 1 FROM t 
 Views cannot start with sidra_staging_view_
 
 # ============================================================
+# Large constraint values (tests int32_t, was uint8_t max 255)
+# ============================================================
+
+# WINDOW > 255 should work (previously overflowed with uint8_t)
+statement error
+CREATE DECENTRALIZED MATERIALIZED VIEW test AS SELECT 1 FROM t WINDOW 500 TTL 1000 REFRESH 300;
+----
+Error
+
+# ============================================================
 # Complex view constraint combinations
 # ============================================================
 

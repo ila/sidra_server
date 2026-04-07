@@ -175,6 +175,12 @@ unordered_map<string, SIDRAConstraints> ExtractTableConstraints(string &query) {
 		}
 
 		if (constraints.fact || constraints.sensitive || constraints.dimension) {
+			int annotation_count = constraints.fact + constraints.sensitive + constraints.dimension;
+			if (annotation_count > 1) {
+				throw ParserException("Column '" + column_name +
+				                      "' has multiple annotations. Each column must have exactly one of "
+				                      "SENSITIVE, FACT, or DIMENSION.");
+			}
 			result.insert(make_pair(column_name, constraints));
 		}
 	}
