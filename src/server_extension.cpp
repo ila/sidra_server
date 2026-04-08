@@ -4,7 +4,6 @@
 #include "compiler_utils.hpp"
 #include "common.hpp"
 #include "flush_function.hpp"
-#include "generate_python_script.hpp"
 #include "optimizer.hpp"
 #include "parser.hpp"
 #include "run_server.hpp"
@@ -98,13 +97,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto run_server = PragmaFunction::PragmaCall("run_server", RunServer, {});
 	loader.RegisterFunction(run_server);
 
-	auto gen_server_script = PragmaFunction::PragmaCall("generate_server_refresh_script", GenerateServerRefreshScript,
-	                                                    {LogicalType::VARCHAR});
-	loader.RegisterFunction(gen_server_script);
-
-	auto gen_client_script = PragmaFunction::PragmaCall("generate_client_refresh_script", GenerateClientRefreshScript,
-	                                                    {LogicalType::VARCHAR});
-	loader.RegisterFunction(gen_client_script);
+	// Load OpenIVM in the main DB for refresh daemon + hooks
+	try {
+		DuckDB db(instance);
+		Connection con(db);
+		auto load_r = con.Query("LOAD './openivm.duckdb_extension'");
+		if (load_r->HasError()) {
+			Printer::Print("Warning: could not load OpenIVM: " + load_r->GetError());
+		} else {
+			SERVER_DEBUG_PRINT("Loaded OpenIVM in main DB (refresh daemon active)");
+		}
+	} catch (const std::exception &e) {
+		Printer::Print("Warning: OpenIVM loading failed: " + string(e.what()));
+	}
 
 	SERVER_DEBUG_PRINT("Registered all pragma functions");
 }

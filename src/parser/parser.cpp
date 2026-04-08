@@ -719,6 +719,11 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		                           "', '" + EscapeSingleQuotes(cmv_data_table) + "', '" + EscapeSingleQuotes(ivm_type) +
 		                           "', now())");
 
+		// TODO: register with OpenIVM daemon for auto-flush scheduling
+		// When OpenIVM is loaded in the main DB, insert into _duckdb_ivm_views + _duckdb_ivm_refresh_hooks
+		// to enable automatic flush via OpenIVM's refresh daemon.
+		// Currently deferred: requires OpenIVM tables to exist in main DB at bind time.
+
 		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type + " source=" + source_view +
 		                   " data_table=" + cmv_data_table + ")");
 
