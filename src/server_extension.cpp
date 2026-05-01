@@ -10,6 +10,7 @@
 #include "server_debug.hpp"
 
 #include "duckdb/common/serializer/buffered_file_reader.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/connection.hpp"
@@ -97,16 +98,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto run_server = PragmaFunction::PragmaCall("run_server", RunServer, {});
 	loader.RegisterFunction(run_server);
 
-	// Load OpenIVM in the main DB for refresh daemon + hooks
+	// Load OpenIVM in the main DB for refresh daemon + hooks.
+	// Use ExtensionHelper to load directly into this instance (not a DuckDB wrapper).
 	try {
-		DuckDB db(instance);
-		Connection con(db);
-		auto load_r = con.Query("LOAD './openivm.duckdb_extension'");
-		if (load_r->HasError()) {
-			Printer::Print("Warning: could not load OpenIVM: " + load_r->GetError());
-		} else {
-			SERVER_DEBUG_PRINT("Loaded OpenIVM in main DB (refresh daemon active)");
-		}
+		auto &fs = instance.GetFileSystem();
+		ExtensionHelper::LoadExternalExtension(instance, fs, "./openivm.duckdb_extension");
+		SERVER_DEBUG_PRINT("Loaded OpenIVM in main DB (refresh daemon active)");
 	} catch (const std::exception &e) {
 		Printer::Print("Warning: OpenIVM loading failed: " + string(e.what()));
 	}

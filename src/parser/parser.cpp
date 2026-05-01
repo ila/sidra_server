@@ -38,6 +38,7 @@ namespace duckdb {
 
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 static thread_local vector<string> g_sidra_main_queries;
+static thread_local vector<string> g_sidra_hook_queries; // non-fatal: requires OpenIVM in main DB
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 static void ExecuteQueries(Connection &con, const vector<string> &queries, const string &error_prefix) {
@@ -57,6 +58,8 @@ unique_ptr<FunctionData> SIDRADDLBindFunction(ClientContext &context, TableFunct
                                               vector<LogicalType> &return_types, vector<string> &names) {
 	auto main_queries = std::move(g_sidra_main_queries);
 	g_sidra_main_queries.clear();
+	auto hook_queries = std::move(g_sidra_hook_queries);
+	g_sidra_hook_queries.clear();
 
 	// Execute metadata inserts in the main DB
 	if (!main_queries.empty()) {
@@ -65,6 +68,17 @@ unique_ptr<FunctionData> SIDRADDLBindFunction(ClientContext &context, TableFunct
 		EnsureMetadataTables(conn);
 		ExecuteQueries(conn, main_queries, "Failed to execute SIDRA DDL: ");
 		SERVER_DEBUG_PRINT("Executed " + to_string(main_queries.size()) + " queries in main DB");
+
+		// Register with OpenIVM refresh daemon (non-fatal: OpenIVM may not be loaded)
+		if (!hook_queries.empty()) {
+			for (auto &hq : hook_queries) {
+				auto result = conn.Query(hq);
+				if (result->HasError()) {
+					SERVER_DEBUG_PRINT("Hook registration skipped (OpenIVM not loaded?): " + result->GetError());
+					break;
+				}
+			}
+		}
 	}
 
 	return_types.push_back(LogicalType::BOOLEAN);
@@ -532,6 +546,12 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		}
 		SERVER_DEBUG_PRINT("[CMV] Modified query:\n" + cmv_query);
 
+		// Set ivm_files_path before CREATE MV so OpenIVM writes system tables + compiled queries
+		string ivm_files_dir = "/tmp/sidra_ivm_compile";
+		LocalFileSystem local_fs;
+		local_fs.CreateDirectory(ivm_files_dir);
+		shadow_con.Query("SET ivm_files_path = '" + ivm_files_dir + "'");
+
 		string create_mv = "CREATE MATERIALIZED VIEW " + view_name + " AS " + cmv_query;
 		auto mv_r = shadow_con.Query(create_mv);
 		if (mv_r->HasError()) {
@@ -635,13 +655,7 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 
 		// Step 4: Get upsert template from OpenIVM
 		// The MV was already compiled in Step 1. Now run PRAGMA ivm to get the upsert SQL.
-		string ivm_files_dir = "/tmp/sidra_ivm_compile";
-		LocalFileSystem local_fs;
-		local_fs.CreateDirectory(ivm_files_dir);
-		auto set_r = shadow_con.Query("SET ivm_files_path = '" + ivm_files_dir + "'");
-		if (set_r->HasError()) {
-			throw ParserException("Failed to set ivm_files_path: " + set_r->GetError());
-		}
+		// ivm_files_path already set before CREATE MV (Step 1)
 		auto ivm_pragma_result = shadow_con.Query("PRAGMA ivm('" + EscapeSingleQuotes(view_name) + "')");
 		if (ivm_pragma_result->HasError()) {
 			throw ParserException("PRAGMA ivm failed for CMV '" + view_name + "': " + ivm_pragma_result->GetError());
@@ -719,13 +733,36 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		                           "', '" + EscapeSingleQuotes(cmv_data_table) + "', '" + EscapeSingleQuotes(ivm_type) +
 		                           "', now())");
 
-		// TODO: register with OpenIVM daemon for auto-flush scheduling
-		// When OpenIVM is loaded in the main DB, insert into _duckdb_ivm_views + _duckdb_ivm_refresh_hooks
-		// to enable automatic flush via OpenIVM's refresh daemon.
-		// Currently deferred: requires OpenIVM tables to exist in main DB at bind time.
+		// Register with OpenIVM daemon for auto-flush scheduling (non-fatal)
+		if (vc.refresh > 0) {
+			int64_t refresh_seconds = static_cast<int64_t>(vc.refresh) * 3600;
+			string escaped_name = EscapeSingleQuotes(view_name);
+			// Read OpenIVM system tables DDL from the compiled file (ensures schema stays in sync)
+			string sys_tables_file = ivm_files_dir + "/ivm_system_tables.sql";
+			std::ifstream sys_f(sys_tables_file);
+			if (sys_f.good()) {
+				string line;
+				while (std::getline(sys_f, line)) {
+					StringUtil::Trim(line);
+					if (!line.empty() && line.back() == ';') {
+						line.pop_back();
+					}
+					if (!line.empty()) {
+						g_sidra_hook_queries.push_back(line);
+					}
+				}
+			}
+			// Register the view with OpenIVM's refresh scheduler
+			g_sidra_hook_queries.push_back("INSERT OR REPLACE INTO _duckdb_ivm_views VALUES('" + escaped_name +
+			                               "', '', 0, false, false, now()::TIMESTAMP, " + to_string(refresh_seconds) +
+			                               ", false)");
+			// Use 'replace' mode: flush INSTEAD of IVM (CMV has its own merge logic)
+			g_sidra_hook_queries.push_back("INSERT OR REPLACE INTO _duckdb_ivm_refresh_hooks VALUES('" + escaped_name +
+			                               "', 'PRAGMA flush(''" + escaped_name + "'', ''duckdb'')', 'replace')");
+		}
 
-		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type + " source=" + source_view +
-		                   " data_table=" + cmv_data_table + ")");
+		SERVER_DEBUG_PRINT("[CMV] Compiled and stored: " + view_name + " (type=" + ivm_type + " source=" +
+		                   source_views_str + " data_table=" + cmv_data_table + ")");
 
 	} else if (data.scope == TableScope::decentralized) {
 		// Validate the view query in the shadow DB (which has table schemas)
@@ -875,6 +912,9 @@ ParserExtensionPlanResult SIDRAParserExtension::SIDRAPlanFunction(ParserExtensio
 	string shadow_db_name = GetShadowDBName(context);
 	DBConfig shadow_config;
 	shadow_config.SetOptionByName("allow_unsigned_extensions", Value(true));
+	// Disable OpenIVM daemon in shadow DB — it's only for compilation, not scheduling
+	shadow_config.AddExtensionOption("ivm_disable_daemon", "disable the refresh daemon",
+	                                 LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	DuckDB shadow_db(shadow_db_name, &shadow_config);
 	Connection shadow_con(shadow_db);
 
