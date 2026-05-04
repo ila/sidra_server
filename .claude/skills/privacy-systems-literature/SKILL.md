@@ -1,6 +1,6 @@
 ---
 name: privacy-systems-literature
-description: Research map for SIDRA-related literature: decentralized analytics, personal data stores, local-first systems, materialized view maintenance, streaming DP, SQL DP, PAC privacy, secure computation, and privacy-preserving database systems.
+description: "Research map for SIDRA-related literature: decentralized analytics, personal data stores, local-first systems, materialized view maintenance, streaming DP, SQL DP, PAC privacy, secure computation, and privacy-preserving database systems."
 ---
 
 # Privacy Systems Literature
@@ -31,4 +31,4 @@ SIDRA should be framed as a declarative architecture/compiler for data minimizat
 
 - For claims about the SIDRA implementation, cite local files or `SIDRA.pdf`.
 - For paper claims, prefer primary sources: arXiv, PVLDB, ACM/USENIX/Microsoft/Google/OpenDP/DuckDB docs.
-- Be explicit about dates for fast-moving projects. The current session date is May 1 2026.
+- Be explicit about dates for fast-moving projects. The current session date is May 4 2026.
