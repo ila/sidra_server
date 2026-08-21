@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "lpts_helpers.hpp"
 
 namespace duckdb {
 
@@ -9,8 +10,6 @@ string ReadFile(const string &file_path);
 string ExtractTableName(const string &sql);
 string ExtractViewName(const string &sql);
 string ExtractViewQuery(string &query);
-string EscapeSingleQuotes(const string &input);
 void ReplaceMaterializedView(string &query);
-void RemoveRedundantWhitespaces(string &query);
 
 } // namespace duckdb

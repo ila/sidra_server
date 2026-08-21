@@ -20,6 +20,7 @@
 #include <mutex>
 #include <netinet/in.h>
 #include <thread>
+#include <unistd.h>
 
 namespace duckdb {
 

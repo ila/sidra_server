@@ -5,7 +5,7 @@
 #include "parser_helpers.hpp"
 #include "server_debug.hpp"
 
-#include "logical_plan_to_sql.hpp"
+#include "lpts_pipeline.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/local_file_system.hpp"
@@ -637,9 +637,9 @@ static vector<string> CompileViewCreation(Connection &shadow_con, SIDRAParseData
 		}
 
 		// Convert modified plan to SQL via LPTS, passing planner.names for correct output aliases
-		LogicalPlanToSql lpts(*shadow_con.context, plan, planner.names);
-		auto cte_list = lpts.LogicalPlanToCteList();
-		string delta_sql = LogicalPlanToSql::CteListToSql(cte_list);
+		auto ast = LogicalPlanToAst(*shadow_con.context, plan);
+		auto cte_list = AstToCteList(*ast);
+		string delta_sql = cte_list->ToQuery(false, planner.names);
 		StringUtil::Trim(delta_sql);
 		if (!delta_sql.empty() && delta_sql.back() == ';') {
 			delta_sql.pop_back();

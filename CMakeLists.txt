@@ -8,7 +8,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 
 set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lpts")
-include_directories(src/include ${LPTS_DIR}/src/include)
+include_directories(src/include
+                    ${LPTS_DIR}/src/include
+                    ${LPTS_DIR}/third_party/ducklake/src/include)
 
 set(EXTENSION_SOURCES
     src/server_extension.cpp
@@ -22,7 +24,11 @@ set(EXTENSION_SOURCES
     src/optimizer/optimizer.cpp
     src/compiler/compiler_utils.cpp
     # LPTS — called from C++ for plan-to-SQL conversion
-    ${LPTS_DIR}/src/logical_plan_to_sql.cpp)
+    ${LPTS_DIR}/src/cte_nodes.cpp
+    ${LPTS_DIR}/src/lpts_helpers.cpp
+    ${LPTS_DIR}/src/lpts_ast.cpp
+    ${LPTS_DIR}/src/lpts_ast_renderer.cpp
+    ${LPTS_DIR}/src/lpts_pipeline.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

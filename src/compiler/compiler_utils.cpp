@@ -2,7 +2,6 @@
 
 #include <fstream>
 #include <regex>
-#include <sstream>
 
 namespace duckdb {
 
@@ -60,53 +59,9 @@ string ExtractViewQuery(string &query) {
 	return "";
 }
 
-string EscapeSingleQuotes(const string &input) {
-	std::stringstream escaped_stream;
-	for (char c : input) {
-		if (c == '\'') {
-			escaped_stream << "''";
-		} else {
-			escaped_stream << c;
-		}
-	}
-	return escaped_stream.str();
-}
-
 void ReplaceMaterializedView(string &query) {
 	query = std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b"), "table if not exists");
 	query = std::regex_replace(query, std::regex("\\s*;$"), "");
-}
-
-void RemoveRedundantWhitespaces(string &query) {
-	query = std::regex_replace(query, std::regex("\\s+"), " ");
-}
-
-// Functions needed by LPTS (logical_plan_to_sql.cpp)
-string VecToSeparatedList(vector<string> input_list, const string &separator) {
-	std::ostringstream ret_str;
-	for (size_t i = 0; i < input_list.size(); ++i) {
-		ret_str << input_list[i];
-		if (i != input_list.size() - 1) {
-			ret_str << separator;
-		}
-	}
-	return ret_str.str();
-}
-
-string SQLToLowercase(const string &sql) {
-	std::stringstream lowercase_stream;
-	bool in_string = false;
-	for (char c : sql) {
-		if (c == '\'') {
-			in_string = !in_string;
-		}
-		if (!in_string) {
-			lowercase_stream << static_cast<char>(tolower(c));
-		} else {
-			lowercase_stream << c;
-		}
-	}
-	return lowercase_stream.str();
 }
 
 } // namespace duckdb
